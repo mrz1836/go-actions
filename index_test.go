@@ -6,10 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrz1836/go-actions"
-	"github.com/mrz1836/go-actions/actiontest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mrz1836/go-actions"
+	"github.com/mrz1836/go-actions/actiontest"
 )
 
 func getBody(t *testing.T, url, accept string) (body, contentType string, status int) {

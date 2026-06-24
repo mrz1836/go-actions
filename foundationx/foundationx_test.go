@@ -6,10 +6,11 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/mrz1836/go-actions"
-	"github.com/mrz1836/go-actions/foundationx"
 	foundation "github.com/mrz1836/go-foundation/models"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/mrz1836/go-actions"
+	"github.com/mrz1836/go-actions/foundationx"
 )
 
 // errOpaque is a static, non-API error used to exercise the redacted-500 path.

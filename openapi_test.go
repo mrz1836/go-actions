@@ -6,10 +6,11 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/mrz1836/go-actions"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	"github.com/mrz1836/go-actions"
 )
 
 func frozenPingRegistry(t *testing.T, opts ...actions.Option) *actions.Registry {

@@ -4,8 +4,9 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/mrz1836/go-actions"
 	foundation "github.com/mrz1836/go-foundation/models"
+
+	"github.com/mrz1836/go-actions"
 )
 
 // NewErrorMapper returns an actions.ErrorMapper that maps the go-foundation
