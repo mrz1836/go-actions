@@ -2,6 +2,7 @@ package actions
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -49,17 +50,17 @@ func (r *Registry) buildOpenAPI() {
 
 	jsonBytes, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		panic("actions: marshal OpenAPI JSON: " + err.Error())
+		panic(fmt.Errorf("actions: marshal OpenAPI JSON: %w", err))
 	}
 	r.openapiJSON = append(jsonBytes, '\n')
 
 	var roundTrip any
 	if decodeErr := json.Unmarshal(jsonBytes, &roundTrip); decodeErr != nil {
-		panic("actions: re-decode OpenAPI: " + decodeErr.Error())
+		panic(fmt.Errorf("actions: re-decode OpenAPI: %w", decodeErr))
 	}
 	yamlBytes, err := yaml.Marshal(roundTrip)
 	if err != nil {
-		panic("actions: marshal OpenAPI YAML: " + err.Error())
+		panic(fmt.Errorf("actions: marshal OpenAPI YAML: %w", err))
 	}
 	r.openapiYAML = yamlBytes
 }

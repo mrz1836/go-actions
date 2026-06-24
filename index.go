@@ -58,7 +58,7 @@ func (r *Registry) buildIndex() {
 
 	var html bytes.Buffer
 	if err := indexPageTemplate.Execute(&html, indexData{Title: r.info.title, Rows: rows}); err != nil {
-		panic("actions: render HTML index: " + err.Error())
+		panic(fmt.Errorf("actions: render HTML index: %w", err))
 	}
 	r.indexHTML = html.Bytes()
 	r.indexMarkdown = renderMarkdownIndex(r.info.title, rows)

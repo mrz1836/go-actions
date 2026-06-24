@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -178,6 +179,82 @@ func TestOpenAPI_JSONYAMLParity(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, string(jsonCanon), string(yamlCanon),
 		"the JSON and YAML serializations must carry identical content")
+}
+
+// collectRefs walks an arbitrary JSON tree and records every "$ref" string value.
+func collectRefs(v any, out map[string]bool) {
+	switch typed := v.(type) {
+	case map[string]any:
+		for k, val := range typed {
+			if k == "$ref" {
+				if s, ok := val.(string); ok {
+					out[s] = true
+				}
+			}
+			collectRefs(val, out)
+		}
+	case []any:
+		for _, val := range typed {
+			collectRefs(val, out)
+		}
+	}
+}
+
+// TestOpenAPI_RefIntegrityAndCompleteness proves the generated contract is
+// internally consistent: every $ref resolves to a defined component, and every
+// registered action appears with its operationId. A dangling $ref would make the
+// published contract unusable by downstream code generators.
+func TestOpenAPI_RefIntegrityAndCompleteness(t *testing.T) {
+	t.Parallel()
+	reg := actions.NewRegistry()
+	actions.Register(reg, getItemAction())
+	actions.Register(reg, deleteItemAction())
+	reg.Freeze()
+
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+
+	components, _ := doc["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+
+	refs := map[string]bool{}
+	collectRefs(doc, refs)
+	require.NotEmpty(t, refs, "expected at least one $ref (the Error schema)")
+	for ref := range refs {
+		name, ok := strings.CutPrefix(ref, "#/components/schemas/")
+		require.Truef(t, ok, "ref %q must point into components/schemas", ref)
+		assert.Containsf(t, schemas, name, "dangling $ref: %s", ref)
+	}
+
+	// Completeness: every registered action is represented by its operationId.
+	paths, _ := doc["paths"].(map[string]any)
+	found := map[string]bool{}
+	for _, pi := range paths {
+		pathItem, _ := pi.(map[string]any)
+		for _, op := range pathItem {
+			if operation, ok := op.(map[string]any); ok {
+				if id, ok := operation["operationId"].(string); ok {
+					found[id] = true
+				}
+			}
+		}
+	}
+	for _, id := range []string{"test.get_item", "test.delete_item"} {
+		assert.Truef(t, found[id], "operationId %s missing from the contract", id)
+	}
+}
+
+// BenchmarkBuildOpenAPI measures the one-time setup cost of validating actions
+// and generating the OpenAPI document plus the _actions index at Freeze time.
+func BenchmarkBuildOpenAPI(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		reg := actions.NewRegistry()
+		actions.Register(reg, getItemAction())
+		actions.Register(reg, deleteItemAction())
+		reg.Freeze()
+		_ = reg.OpenAPIJSON()
+	}
 }
 
 // normalizeYAML converts yaml.v3's map[string]interface{} / map[interface{}]

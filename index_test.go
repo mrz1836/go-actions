@@ -70,6 +70,15 @@ func TestIndex(t *testing.T) {
 		assert.Contains(t, contentType, "text/html")
 	})
 
+	t.Run("Markdown with quality factors still negotiates Markdown", func(t *testing.T) {
+		t.Parallel()
+		// Exercises the q-factor (;) stripping across a multi-entry Accept header.
+		body, contentType, status := getBody(t, newServer(t)+"/_actions", "text/markdown;q=0.9, text/html;q=0.8")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Contains(t, contentType, "text/markdown")
+		assert.True(t, strings.HasPrefix(body, "# API Actions"))
+	})
+
 	t.Run("openapi.json and openapi.yaml served", func(t *testing.T) {
 		t.Parallel()
 		base := newServer(t)
