@@ -76,7 +76,7 @@ jobs:
       # Checkout code (required for local actions)
       # --------------------------------------------------------------------
       - name: 📥 Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # --------------------------------------------------------------------
       # Parse environment variables
@@ -321,7 +321,7 @@ jobs:
       # Checkout code (required for local actions)
       # --------------------------------------------------------------------
       - name: 📥 Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # --------------------------------------------------------------------
       # Parse environment variables
@@ -372,7 +372,7 @@ jobs:
       # --------------------------------------------------------------------
       - name: 💾 Restore govulncheck binary cache
         id: govuln-cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: |
             ~/.cache/govulncheck-bin
@@ -562,7 +562,7 @@ jobs:
       # Checkout code (required for local actions)
       # --------------------------------------------------------------------
       - name: 📥 Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0 # Fetch all history so Gitleaks can scan commits
 
@@ -613,7 +613,7 @@ jobs:
         # NOTE: gitleaks/gitleaks-action@v2.3.9 is the latest release and still uses Node.js 20.
         # This will trigger a "Node.js 20 actions are deprecated" warning until the gitleaks
         # maintainers release a new version with Node.js 24 support. Expected and harmless for now.
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_LICENSE: ${{ secrets.gitleaks-license }}
