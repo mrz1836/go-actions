@@ -3,6 +3,7 @@ package actions_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -215,6 +216,107 @@ func TestRegistry(t *testing.T) {
 		}
 		if resp.Body.Greeting != "hi amy" {
 			t.Fatalf("greeting = %q", resp.Body.Greeting)
+		}
+	})
+}
+
+// errBoom is a static, opaque handler error used to exercise the redacted-500
+// path; its message must never reach the wire.
+var errBoom = errors.New("internal boom detail")
+
+// boomAction returns a plain (non-APIError) error, exercising the redacted 500
+// path through the registry-built handler.
+func boomAction() actions.Action[pingReq, pingResp] {
+	return actions.Action[pingReq, pingResp]{
+		ID:       "test.boom",
+		Method:   http.MethodPost,
+		Path:     "/boom",
+		Summary:  "Boom",
+		Statuses: []actions.StatusDoc{{Code: http.StatusInternalServerError, Description: "boom", Error: true}},
+		Handle: func(_ context.Context, _ pingReq) (pingResp, error) {
+			return pingResp{}, errBoom
+		},
+	}
+}
+
+// missingAction returns a typed *APIError, exercising the mapped-status path.
+func missingAction() actions.Action[pingReq, pingResp] {
+	return actions.Action[pingReq, pingResp]{
+		ID:      "test.missing",
+		Method:  http.MethodPost,
+		Path:    "/missing",
+		Summary: "Missing",
+		Statuses: []actions.StatusDoc{
+			{Code: http.StatusOK, Description: "ok"},
+			{Code: http.StatusNotFound, Description: "missing", Error: true},
+		},
+		Handle: func(_ context.Context, _ pingReq) (pingResp, error) {
+			return pingResp{}, &actions.APIError{
+				Status:  http.StatusNotFound,
+				Code:    actions.CodeNotFound,
+				Message: "nope",
+			}
+		},
+	}
+}
+
+// TestRegistry_HandlerErrors covers the error branches of the registry-built
+// handler: a malformed body (400), a plain handler error (redacted 500), and a
+// typed *APIError returned by a handler (mapped through to its status).
+func TestRegistry_HandlerErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("plain handler error maps to a redacted 500", func(t *testing.T) {
+		t.Parallel()
+		reg := actions.NewRegistry()
+		actions.Register(reg, boomAction())
+		srv := actiontest.NewServer(t, reg)
+
+		resp := postJSON(t, srv.URL+"/boom", `{"name":"jane"}`)
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", resp.StatusCode)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if strings.Contains(string(b), "internal boom detail") {
+			t.Fatalf("body leaked the internal error detail: %s", b)
+		}
+		if !strings.Contains(string(b), actions.CodeInternal) {
+			t.Fatalf("body = %s, want code %s", b, actions.CodeInternal)
+		}
+	})
+
+	t.Run("typed APIError passes through with its status", func(t *testing.T) {
+		t.Parallel()
+		reg := actions.NewRegistry()
+		actions.Register(reg, missingAction())
+		srv := actiontest.NewServer(t, reg)
+
+		resp := postJSON(t, srv.URL+"/missing", `{"name":"jane"}`)
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(b), actions.CodeNotFound) {
+			t.Fatalf("body = %s, want code %s", b, actions.CodeNotFound)
+		}
+	})
+
+	t.Run("malformed body maps to 400", func(t *testing.T) {
+		t.Parallel()
+		reg := actions.NewRegistry()
+		actions.Register(reg, pingAction())
+		srv := actiontest.NewServer(t, reg)
+
+		resp := postJSON(t, srv.URL+"/ping", `{"name":`)
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(b), actions.CodeBadRequest) {
+			t.Fatalf("body = %s, want code %s", b, actions.CodeBadRequest)
 		}
 	})
 }
