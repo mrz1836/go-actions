@@ -176,6 +176,52 @@ func TestDecodeRequest(t *testing.T) {
 			t.Fatalf("error = %v, want 422 *APIError", err)
 		}
 	})
+
+	t.Run("unsigned int query binds", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Limit uint `json:"-" query:"limit"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?limit=25", nil)
+		got, err := decodeRequest[req](r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Limit != 25 {
+			t.Fatalf("decoded = %+v, want Limit 25", got)
+		}
+	})
+
+	t.Run("negative unsigned int query returns 422", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Limit uint `json:"-" query:"limit"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?limit=-5", nil)
+		_, err := decodeRequest[req](r)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
+			t.Fatalf("error = %v, want 422 *APIError", err)
+		}
+	})
+
+	t.Run("unbindable field kind returns 500 instead of panicking", func(t *testing.T) {
+		t.Parallel()
+		// A slice-kind query field is a server-side declaration error: it must
+		// fail cleanly, not panic on reflect.Value.SetString.
+		type req struct {
+			Tags []string `json:"-" query:"tags"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?tags=a", nil)
+		_, err := decodeRequest[req](r)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
+			t.Fatalf("error = %v, want 500 *APIError", err)
+		}
+		if apiErr.Code != CodeInternal {
+			t.Fatalf("code = %s, want %s", apiErr.Code, CodeInternal)
+		}
+	})
 }
 
 // FuzzDecodeRequest proves decodeRequest never panics on arbitrary body bytes

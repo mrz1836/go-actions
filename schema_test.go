@@ -172,4 +172,66 @@ func TestSchemaFor(t *testing.T) {
 			t.Fatalf("properties = %v, want only visible", props)
 		}
 	})
+
+	t.Run("field without a json tag is keyed by its Go name", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Name string // no json tag → jsonName falls back to the field name
+		}
+		b := newSchemaBuilder()
+		schema := b.structSchema(reflect.TypeFor[req]())
+		props, _ := schema["properties"].(map[string]any)
+		if _, ok := props["Name"]; !ok {
+			t.Fatalf("properties = %v, want key Name", props)
+		}
+	})
+}
+
+// TestResponseSchema_EmptyHasNoBody covers the Empty branch of responseSchema:
+// an envelope whose Body field is absent yields no response schema.
+func TestResponseSchema_EmptyHasNoBody(t *testing.T) {
+	t.Parallel()
+	b := newSchemaBuilder()
+	schema, hasBody := b.responseSchema(reflect.TypeFor[Empty]())
+	if hasBody || schema != nil {
+		t.Fatalf("responseSchema(Empty) = (%v, %v), want (nil, false)", schema, hasBody)
+	}
+}
+
+// TestBuildRequestBody covers the no-body branches: a non-struct request type
+// and a struct whose fields are all bound from path/query (no JSON body).
+func TestBuildRequestBody(t *testing.T) {
+	t.Parallel()
+
+	t.Run("non-struct request type has no body", func(t *testing.T) {
+		t.Parallel()
+		b := newSchemaBuilder()
+		if got := buildRequestBody(b, reflect.TypeOf("")); got != nil {
+			t.Fatalf("buildRequestBody(string) = %v, want nil", got)
+		}
+	})
+
+	t.Run("request with only path/query fields has no body", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			ID    string `json:"-" path:"id"`
+			Limit int    `json:"-" query:"limit"`
+		}
+		b := newSchemaBuilder()
+		if got := buildRequestBody(b, reflect.TypeFor[req]()); got != nil {
+			t.Fatalf("buildRequestBody(no-body req) = %v, want nil", got)
+		}
+	})
+
+	t.Run("request with JSON fields produces a required body", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Name string `json:"name"`
+		}
+		b := newSchemaBuilder()
+		got := buildRequestBody(b, reflect.TypeFor[req]())
+		if got == nil || got["required"] != true {
+			t.Fatalf("buildRequestBody(body req) = %v, want a required body", got)
+		}
+	})
 }

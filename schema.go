@@ -167,13 +167,20 @@ func applyConstraints(schema map[string]any, validateTag string) {
 	}
 }
 
+// jsonFirstSegment returns the name portion (the first comma-separated segment)
+// of a json struct-tag value, e.g. "name" from "name,omitempty".
+func jsonFirstSegment(tag string) string {
+	name, _, _ := strings.Cut(tag, ",")
+	return name
+}
+
 // jsonName returns a struct field's JSON name.
 func jsonName(f reflect.StructField) string {
 	tag := f.Tag.Get("json")
 	if tag == "" {
 		return f.Name
 	}
-	return strings.Split(tag, ",")[0]
+	return jsonFirstSegment(tag)
 }
 
 // hasRule reports whether a validate tag contains the named rule.

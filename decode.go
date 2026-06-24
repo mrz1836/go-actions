@@ -92,7 +92,7 @@ func hasTag(f reflect.StructField, key string) bool {
 // the Go field name.
 func tagName(f reflect.StructField) string {
 	if j := f.Tag.Get("json"); j != "" && j != "-" {
-		return strings.Split(j, ",")[0]
+		return jsonFirstSegment(j)
 	}
 	return f.Name
 }
@@ -123,6 +123,15 @@ func setScalar(fv reflect.Value, raw, name string) error {
 			}
 		}
 		fv.SetInt(n)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return &APIError{
+				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
+				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be a non-negative integer"}},
+			}
+		}
+		fv.SetUint(n)
 	case reflect.Float32, reflect.Float64:
 		n, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
@@ -133,7 +142,14 @@ func setScalar(fv reflect.Value, raw, name string) error {
 		}
 		fv.SetFloat(n)
 	default:
-		fv.SetString(raw)
+		// A path/query/header field of an unbindable kind is a server-side
+		// declaration error, not bad client input. Fail cleanly with a 500
+		// rather than panicking on SetString for a non-string kind.
+		return &APIError{
+			Status:  http.StatusInternalServerError,
+			Code:    CodeInternal,
+			Message: "unsupported request field type: " + fv.Kind().String(),
+		}
 	}
 	return nil
 }
