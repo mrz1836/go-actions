@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"errors"
 	"net/http"
 	"net/mail"
 	"reflect"
@@ -12,6 +13,15 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// Validatable is the optional escape hatch for validation a struct tag cannot
+// express. A request type that implements it has Validate called after the
+// tag-driven rules pass; a returned *APIError contributes its field details to
+// the 422 response, and any other error becomes a single message-level failure.
+// Implement it on the value or pointer receiver.
+type Validatable interface {
+	Validate() error
+}
 
 // e164Pattern matches a canonical E.164 phone string.
 var e164Pattern = regexp.MustCompile(`^\+[1-9]\d{1,14}$`)
@@ -49,6 +59,9 @@ func validateRequest(v any) *APIError {
 			}
 		}
 	}
+
+	fields = append(fields, customValidation(v)...)
+
 	if len(fields) == 0 {
 		return nil
 	}
@@ -58,6 +71,28 @@ func validateRequest(v any) *APIError {
 		Message: "validation failed",
 		Fields:  fields,
 	}
+}
+
+// customValidation runs a request's optional Validatable hook and translates its
+// error into field details. An *APIError contributes its Fields (or its message
+// when it carries none); any other error becomes one message-level failure.
+func customValidation(v any) []FieldError {
+	cv, ok := v.(Validatable)
+	if !ok {
+		return nil
+	}
+	err := cv.Validate()
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if len(apiErr.Fields) > 0 {
+			return apiErr.Fields
+		}
+		return []FieldError{{Message: apiErr.Message}}
+	}
+	return []FieldError{{Message: err.Error()}}
 }
 
 // applyRule evaluates one validate rule against fv, returning a failure message

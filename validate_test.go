@@ -1,6 +1,77 @@
 package actions
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+// errPlain is a static, non-API error used to exercise the plain-error branch of
+// custom validation.
+var errPlain = errors.New("plain failure")
+
+// customReq exercises the Validatable escape hatch alongside tag rules.
+type customReq struct {
+	Code string `json:"code" validate:"required"`
+}
+
+// Validate returns a field-keyed *APIError for "BAD", a plain error for "PLAIN",
+// and nil otherwise.
+func (c customReq) Validate() error {
+	switch c.Code {
+	case "BAD":
+		return &APIError{Fields: []FieldError{{Field: "code", Message: "must not be BAD"}}}
+	case "MSG":
+		return &APIError{Message: "bad coupon"}
+	case "PLAIN":
+		return errPlain
+	default:
+		return nil
+	}
+}
+
+func TestValidatable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("custom APIError field details merge into the 422", func(t *testing.T) {
+		t.Parallel()
+		err := validateRequest(&customReq{Code: "BAD"})
+		if err == nil || len(err.Fields) != 1 || err.Fields[0].Field != "code" {
+			t.Fatalf("got %+v, want one 'code' field error", err)
+		}
+	})
+
+	t.Run("custom plain error becomes a message-level failure", func(t *testing.T) {
+		t.Parallel()
+		err := validateRequest(&customReq{Code: "PLAIN"})
+		if err == nil || len(err.Fields) != 1 || err.Fields[0].Message != "plain failure" {
+			t.Fatalf("got %+v, want a message-level failure", err)
+		}
+	})
+
+	t.Run("custom APIError without fields becomes a message-level failure", func(t *testing.T) {
+		t.Parallel()
+		err := validateRequest(&customReq{Code: "MSG"})
+		if err == nil || len(err.Fields) != 1 || err.Fields[0].Field != "" || err.Fields[0].Message != "bad coupon" {
+			t.Fatalf("got %+v, want one message-level failure", err)
+		}
+	})
+
+	t.Run("a valid value passes custom validation", func(t *testing.T) {
+		t.Parallel()
+		if err := validateRequest(&customReq{Code: "OK"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("tag rules and custom validation both contribute", func(t *testing.T) {
+		t.Parallel()
+		// Empty Code fails the required tag; custom Validate returns nil for "".
+		err := validateRequest(&customReq{})
+		if err == nil || len(err.Fields) != 1 || err.Fields[0].Message != "is required" {
+			t.Fatalf("got %+v, want the required-tag failure", err)
+		}
+	})
+}
 
 //nolint:gocognit,gocyclo // Test function with multiple sub-tests
 func TestValidateRequest(t *testing.T) {
