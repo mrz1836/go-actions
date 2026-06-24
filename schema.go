@@ -125,7 +125,7 @@ func (b *schemaBuilder) responseSchema(respType reflect.Type) (map[string]any, b
 
 // applyConstraints folds validate-tag rules into a field schema.
 //
-//nolint:gocognit,gocyclo // one switch over the small fixed rule vocabulary
+//nolint:gocyclo // one switch over the small fixed rule vocabulary
 func applyConstraints(schema map[string]any, validateTag string) {
 	if validateTag == "" {
 		return

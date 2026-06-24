@@ -20,8 +20,6 @@ var e164Pattern = regexp.MustCompile(`^\+[1-9]\d{1,14}$`)
 // detail list, or nil when the request is valid. The same tags feed the JSON
 // Schema generator, so the published contract cannot diverge from runtime
 // validation.
-//
-//nolint:gocognit // one loop over a struct's validate tags
 func validateRequest(v any) *APIError {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Pointer {
@@ -65,7 +63,7 @@ func validateRequest(v any) *APIError {
 // or "" when the rule holds. Format rules are skipped on an empty value — only
 // "required" fails on emptiness.
 //
-//nolint:gocognit,gocyclo // one switch over the small fixed rule vocabulary
+//nolint:gocyclo // one switch over the small fixed rule vocabulary
 func applyRule(rule string, fv reflect.Value) string {
 	key, arg, _ := strings.Cut(rule, "=")
 	if key == "required" {
