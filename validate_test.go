@@ -183,4 +183,96 @@ func TestValidateRequest(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+
+	t.Run("format rule on a non-string field reports a violation", func(t *testing.T) {
+		t.Parallel()
+		// stringOf returns "" for a non-string, non-empty kind; uuid.Parse("") fails.
+		type req struct {
+			Code int `json:"code" validate:"uuid"`
+		}
+		if err := validateRequest(req{Code: 7}); err == nil {
+			t.Fatal("expected a uuid-format violation on a non-string field")
+		}
+	})
+
+	t.Run("min and max boundaries are inclusive", func(t *testing.T) {
+		t.Parallel()
+		type strReq struct {
+			Code string `json:"code" validate:"min=2,max=4"`
+		}
+		type numReq struct {
+			N int `json:"n" validate:"min=10,max=20"`
+		}
+		tests := []struct {
+			name    string
+			err     *APIError
+			wantErr bool
+		}{
+			{"string at min length", validateRequest(strReq{Code: "ab"}), false},
+			{"string below min length", validateRequest(strReq{Code: "a"}), true},
+			{"string at max length", validateRequest(strReq{Code: "abcd"}), false},
+			{"string above max length", validateRequest(strReq{Code: "abcde"}), true},
+			{"number at min", validateRequest(numReq{N: 10}), false},
+			{"number below min", validateRequest(numReq{N: 9}), true},
+			{"number at max", validateRequest(numReq{N: 20}), false},
+			{"number above max", validateRequest(numReq{N: 21}), true},
+		}
+		for _, tt := range tests {
+			if tt.wantErr && tt.err == nil {
+				t.Fatalf("%s: expected a boundary violation", tt.name)
+			}
+			if !tt.wantErr && tt.err != nil {
+				t.Fatalf("%s: unexpected violation: %v", tt.name, tt.err)
+			}
+		}
+	})
+}
+
+// FuzzValidateRequest proves validateRequest never panics across the full rule
+// vocabulary (required/min/max/oneof/uuid/email/e164/rfc3339) when fed arbitrary
+// field values.
+func FuzzValidateRequest(f *testing.F) {
+	f.Add("jane@example.com", "+13055551234", "01900000-0000-7000-8000-000000000001", "2026-05-20T00:00:00Z", "b", 50)
+	f.Add("", "", "", "", "", 0)
+	f.Add("not-an-email", "12345", "not-a-uuid", "yesterday", "z", -1)
+	f.Add("\x00", "\x00", "\x00", "\x00", "\x00", 1<<31)
+	f.Fuzz(func(_ *testing.T, email, phone, id, when, kind string, n int) {
+		type req struct {
+			Email string `json:"email" validate:"email"`
+			Phone string `json:"phone" validate:"e164"`
+			ID    string `json:"id" validate:"uuid"`
+			When  string `json:"when" validate:"rfc3339"`
+			Kind  string `json:"kind" validate:"required,oneof=a b c"`
+			Limit int    `json:"limit" validate:"min=1,max=100"`
+		}
+		// contract: must not panic on any input.
+		_ = validateRequest(req{Email: email, Phone: phone, ID: id, When: when, Kind: kind, Limit: n})
+	})
+}
+
+// BenchmarkValidateRequest measures the reflection cost of validating a request
+// struct across the full rule vocabulary on the per-request hot path.
+func BenchmarkValidateRequest(b *testing.B) {
+	type req struct {
+		Email string `json:"email" validate:"required,email"`
+		Phone string `json:"phone" validate:"e164"`
+		ID    string `json:"id" validate:"uuid"`
+		When  string `json:"when" validate:"rfc3339"`
+		Kind  string `json:"kind" validate:"oneof=a b c"`
+		Limit int    `json:"limit" validate:"min=1,max=100"`
+	}
+	v := req{
+		Email: "jane@example.com",
+		Phone: "+13055551234",
+		ID:    "01900000-0000-7000-8000-000000000001",
+		When:  "2026-05-20T00:00:00Z",
+		Kind:  "b",
+		Limit: 50,
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := validateRequest(v); err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
 }

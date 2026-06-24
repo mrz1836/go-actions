@@ -5,6 +5,7 @@ import (
 	"net/mail"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -83,11 +84,8 @@ func applyRule(rule string, fv reflect.Value) string {
 		return checkBound(fv, arg, false)
 	case "oneof":
 		allowed := strings.Fields(arg)
-		s := stringOf(fv)
-		for _, a := range allowed {
-			if s == a {
-				return ""
-			}
+		if slices.Contains(allowed, stringOf(fv)) {
+			return ""
 		}
 		return "must be one of: " + strings.Join(allowed, ", ")
 	case "uuid":

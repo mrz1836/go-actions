@@ -5,9 +5,10 @@
 package petstore
 
 import (
+	"cmp"
 	"context"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -137,7 +138,7 @@ func (s *store) list(limit int) []Pet {
 	for _, p := range s.pets {
 		out = append(out, p)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	slices.SortFunc(out, func(a, b Pet) int { return cmp.Compare(a.ID, b.ID) })
 	if limit > 0 && limit < len(out) {
 		out = out[:limit]
 	}
