@@ -114,10 +114,14 @@ unique method+path, and documented statuses — so a misconfigured route fails o
 not in production.
 
 - **One declaration, many artifacts** — handler, schema, OpenAPI, and docs all generated from one typed struct.
-- **No domain coupling** — the core imports only the standard library, `go-chi/chi/v5`, `google/uuid`, and `gopkg.in/yaml.v3`.
+- **Production-safe by default** — panic recovery, a 1 MiB request-body cap, request-id propagation, and JSON `404`/`405` responses are on out of the box, every one overridable.
+- **Composable middleware** — registry-wide (`WithMiddleware`) and per-action (`Action.Middleware`) using the standard chi/`net-http` signature, for auth, CORS, logging, and rate limiting.
+- **Observability hook** — one `WithObserver` callback receives each request's action id, status, latency, and error — the seam for access logs, metrics, and tracing.
+- **Documented auth** — declare OpenAPI `securitySchemes` and per-operation `security` (with `BearerAuth`/`APIKeyAuth` helpers) so the contract states how to authenticate.
 - **Pluggable error mapping** — decouple your domain errors from the wire shape with an `ErrorMapper`.
 - **Self-documenting** — serve `/openapi.json`, `/openapi.yaml`, and a browsable `/_actions` index straight from the registry.
-- **Struct-tag validation** — `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, and `rfc3339`, with the same tags feeding the JSON Schema.
+- **Struct-tag validation, with an escape hatch** — `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, `rfc3339` (the same tags feed the JSON Schema), plus a `Validatable` interface for rules a tag can't express.
+- **No domain coupling** — the core imports only the standard library, `go-chi/chi/v5`, `google/uuid`, and `gopkg.in/yaml.v3`.
 
 > Why it matters: in 2026, your API contract is consumed by SDK generators, API
 > gateways, and AI agents calling tools. A contract generated from the code that
@@ -188,7 +192,9 @@ func createUser() actions.Action[createUserReq, actions.Created[user]] {
 
 Response envelopes set the documented status: `actions.Empty` → 204,
 `actions.Created[T]` → 201, `actions.Accepted[T]` → 202. Returning any other value
-encodes as 200.
+encodes as 200. For full control, return `actions.Response[T]` to set a custom status
+and response headers (e.g. `Cache-Control`/`ETag`), or `actions.Page[T]` for a
+conventional cursor-paginated list body.
 
 ### 2. Register, freeze, and mount
 
@@ -292,6 +298,78 @@ reg := actions.NewRegistry(actions.WithErrorMapper(foundationx.NewErrorMapper())
 | `WithInfo(title, desc, version)`| Sets the OpenAPI `info` block; the title also names the `_actions` index. |
 | `WithErrorMapper(mapper)`       | Installs a custom error mapper (replaces the default generic one).  |
 | `WithStripPrefix(prefix)`       | Strips a namespace prefix from each action's `Path` when routing (e.g. when the registry is mounted under that prefix). |
+| `WithMiddleware(mw...)`         | Registry-wide middleware applied to every route (actions, self-docs, `404`/`405`). |
+| `WithMaxBodyBytes(n)`           | Caps the request body (default 1 MiB; `0` disables). Over-limit ⇒ `413`. |
+| `WithObserver(fn)`              | Per-request hook with action id, status, latency, and error.       |
+| `WithRequestIDGenerator(fn)`    | Overrides how a correlation id is minted when none is inbound (default UUIDv4). |
+| `WithNotFoundHandler(h)` / `WithMethodNotAllowedHandler(h)` | Override the JSON `404` / `405` defaults. |
+| `WithSecurityScheme(name, scheme)` | Declares an OpenAPI security scheme (`BearerAuth`/`APIKeyAuth` helpers). |
+| `WithSecurity(reqs...)`         | Sets registry-wide default security requirements.                  |
+| `WithServers(servers...)`       | Sets the OpenAPI `servers[]` block.                                 |
+| `WithOpenAPIVersion(v)`         | Declares the dialect: `"3.1.0"` (default) or `"3.0.3"`.            |
+
+</details>
+
+<details>
+<summary><strong><code>Production middleware & safety</code></strong></summary>
+<br/>
+
+Every registry ships a built-in middleware chain wrapping the typed pipeline — all on by
+default and overridable:
+
+- **Panic recovery** — a panicking handler becomes a logged, redacted `500` (and a non-nil
+  `Observation.Err`); the connection is never torn down.
+- **Request-body cap** — bodies over `WithMaxBodyBytes` (default 1 MiB) are rejected with
+  `413`. Pass `0` to disable.
+- **Request-id propagation** — an inbound `X-Request-ID` / `X-Amzn-Request-Id` is reused,
+  otherwise one is generated; it is placed in the context (`actions.RequestIDFromContext`),
+  echoed on the response, and included in every error envelope.
+- **JSON `404` / `405`** — unmatched routes and wrong methods return the standard error
+  envelope, not chi's plain text.
+
+Per-action knobs live on the `Action` struct:
+
+```go
+actions.Action[Req, Resp]{
+    // ...
+    Middleware: []actions.Middleware{authOnly}, // wraps just this route
+    Timeout:    2 * time.Second,                // ctx deadline → 504 on overrun
+    Security:   []actions.SecurityRequirement{{"BearerAuth": {"admin"}}},
+    Deprecated: true,                           // marked deprecated in OpenAPI
+}
+```
+
+Wire observability with one hook:
+
+```go
+reg := actions.NewRegistry(actions.WithObserver(func(o actions.Observation) {
+    slog.Info("request",
+        "action", o.ActionID, "status", o.Status,
+        "ms", o.Duration.Milliseconds(), "err", o.Err)
+}))
+```
+
+</details>
+
+<details>
+<summary><strong><code>Auth & OpenAPI security</code></strong></summary>
+<br/>
+
+Declare security schemes once; reference them registry-wide or per action. They surface in
+the generated contract under `components.securitySchemes` and `security`:
+
+```go
+reg := actions.NewRegistry(
+    actions.WithSecurityScheme("BearerAuth", actions.BearerAuth("JWT")),
+    actions.WithSecurityScheme("ApiKeyAuth", actions.APIKeyAuth("header", "X-API-Key")),
+    actions.WithSecurity(actions.SecurityRequirement{"ApiKeyAuth": nil}), // default for all ops
+    actions.WithServers(actions.Server{URL: "https://api.example.com", Description: "production"}),
+)
+```
+
+go-actions does not authenticate requests itself — wire your auth as `WithMiddleware` or a
+per-action `Middleware`; the security blocks document *how* clients authenticate so SDK
+generators and gateways configure it correctly.
 
 </details>
 
@@ -307,6 +385,10 @@ Schema constraints. Supported rules:
 For strings and slices, `min`/`max` bound the length; for numbers they bound the value.
 Format rules (`uuid`, `email`, etc.) are skipped on an empty value — use `required` to
 reject emptiness.
+
+For rules a tag can't express, a request type may implement `Validatable`
+(`Validate() error`); it runs after the tag rules and its field details merge into the
+`422` response.
 
 </details>
 
@@ -457,7 +539,7 @@ Run the Go benchmarks:
 magex bench
 ```
 
-> Benchmarks cover the hot path — request decoding and response encoding through the typed pipeline.
+> Benchmarks cover the hot path — request decoding, validation, and response encoding through the typed pipeline — plus the one-time OpenAPI contract generation.
 
 <br/>
 
