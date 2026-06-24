@@ -11,9 +11,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// openAPIVersion is the OpenAPI dialect the generated document declares.
-const openAPIVersion = "3.1.0"
-
 // buildArtifacts assembles the OpenAPI document and the _actions index from the
 // frozen, sorted action set. It is called once by Freeze.
 func (r *Registry) buildArtifacts() {
@@ -37,15 +34,42 @@ func (r *Registry) buildOpenAPI() {
 	}
 	sb.components["Error"] = errorSchema()
 
+	version := r.openapiVersion
+	if version == "" {
+		version = defaultOpenAPIVersion
+	}
+	components := map[string]any{"schemas": sb.components}
+	if len(r.securitySchemes) > 0 {
+		schemes := make(map[string]any, len(r.securitySchemes))
+		for name, scheme := range r.securitySchemes {
+			schemes[name] = scheme.toMap()
+		}
+		components["securitySchemes"] = schemes
+	}
+
 	doc := map[string]any{
-		"openapi": openAPIVersion,
+		"openapi": version,
 		"info": map[string]any{
 			"title":       r.info.title,
 			"version":     r.info.version,
 			"description": r.info.description,
 		},
 		"paths":      paths,
-		"components": map[string]any{"schemas": sb.components},
+		"components": components,
+	}
+	if len(r.servers) > 0 {
+		servers := make([]any, len(r.servers))
+		for i, s := range r.servers {
+			m := map[string]any{"url": s.URL}
+			if s.Description != "" {
+				m["description"] = s.Description
+			}
+			servers[i] = m
+		}
+		doc["servers"] = servers
+	}
+	if len(r.security) > 0 {
+		doc["security"] = securityToList(r.security)
 	}
 
 	jsonBytes, err := json.MarshalIndent(doc, "", "  ")
@@ -75,8 +99,14 @@ func buildOperation(sb *schemaBuilder, a anyAction) map[string]any {
 	if a.description != "" {
 		op["description"] = a.description
 	}
+	if a.deprecated {
+		op["deprecated"] = true
+	}
 	if len(a.tags) > 0 {
 		op["tags"] = a.tags
+	}
+	if len(a.security) > 0 {
+		op["security"] = securityToList(a.security)
 	}
 	if params := buildParameters(sb, a.reqType); len(params) > 0 {
 		op["parameters"] = params

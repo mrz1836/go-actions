@@ -10,11 +10,14 @@ import (
 // Stable, transport-level error codes. These are generic HTTP error codes with
 // no domain coupling; a custom ErrorMapper may emit any code it likes.
 const (
-	CodeValidation = "VALIDATION_ERROR"
-	CodeBadRequest = "BAD_REQUEST"
-	CodeNotFound   = "NOT_FOUND"
-	CodeConflict   = "CONFLICT"
-	CodeInternal   = "INTERNAL_ERROR"
+	CodeValidation       = "VALIDATION_ERROR"
+	CodeBadRequest       = "BAD_REQUEST"
+	CodeNotFound         = "NOT_FOUND"
+	CodeConflict         = "CONFLICT"
+	CodeInternal         = "INTERNAL_ERROR"
+	CodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
+	CodePayloadTooLarge  = "PAYLOAD_TOO_LARGE"
+	CodeTimeout          = "TIMEOUT"
 )
 
 // FieldError is one per-field validation failure.
@@ -90,6 +93,18 @@ func (r *Registry) writeError(w http.ResponseWriter, req *http.Request, err erro
 	if apiErr.Status >= http.StatusInternalServerError {
 		slog.ErrorContext(req.Context(), "actions: handler error", "error", err)
 	}
+	// Surface the handled error to the observe middleware, which runs outside the
+	// typed handler and otherwise sees only the status code.
+	if st, ok := req.Context().Value(observeStateKey).(*observeState); ok {
+		st.err = err
+	}
+	r.writeAPIError(w, req, apiErr)
+}
+
+// writeAPIError writes an already-mapped APIError as the standard JSON error
+// envelope, flattening any field details into the message. It is the single
+// write path shared by handler errors, panics, and the 404/405 defaults.
+func (r *Registry) writeAPIError(w http.ResponseWriter, req *http.Request, apiErr APIError) {
 	message := apiErr.Message
 	if len(apiErr.Fields) > 0 {
 		parts := make([]string, len(apiErr.Fields))

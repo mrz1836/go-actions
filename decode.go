@@ -73,6 +73,14 @@ func decodeBody[Req any](r *http.Request, req *Req) error {
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return &APIError{
+				Status:  http.StatusRequestEntityTooLarge,
+				Code:    CodePayloadTooLarge,
+				Message: "request body too large",
+			}
+		}
 		return &APIError{
 			Status:  http.StatusBadRequest,
 			Code:    CodeBadRequest,

@@ -31,9 +31,37 @@ func (Accepted[T]) envelopeStatus() int { return http.StatusAccepted }
 // envelopeBody returns the wrapped Accepted body.
 func (a Accepted[T]) envelopeBody() any { return a.Body }
 
-// encodeResponse writes a successful response. An Empty/Created/Accepted
-// wrapper sets the documented status; any other value is encoded as 200.
+// envelopeStatus reports a Response's status, defaulting to 200 OK when unset.
+func (r Response[T]) envelopeStatus() int {
+	if r.Status == 0 {
+		return http.StatusOK
+	}
+	return r.Status
+}
+
+// envelopeBody returns the wrapped Response body.
+func (r Response[T]) envelopeBody() any { return r.Body }
+
+// envelopeHeaders returns the Response's optional extra headers.
+func (r Response[T]) envelopeHeaders() http.Header { return r.Header }
+
+// headerEnvelope is the optional second interface a response wrapper may
+// implement to contribute extra response headers (see Response).
+type headerEnvelope interface {
+	envelopeHeaders() http.Header
+}
+
+// encodeResponse writes a successful response. An Empty/Created/Accepted/Response
+// wrapper sets the documented status (and Response may add headers); any other
+// value is encoded as 200.
 func encodeResponse(w http.ResponseWriter, resp any) {
+	if h, ok := resp.(headerEnvelope); ok {
+		for key, vals := range h.envelopeHeaders() {
+			for _, v := range vals {
+				w.Header().Add(key, v)
+			}
+		}
+	}
 	if env, ok := resp.(responseEnvelope); ok {
 		status := env.envelopeStatus()
 		if status == http.StatusNoContent {
