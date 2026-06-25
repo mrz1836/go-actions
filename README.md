@@ -193,8 +193,30 @@ func createUser() actions.Action[createUserReq, actions.Created[user]] {
 Response envelopes set the documented status: `actions.Empty` → 204,
 `actions.Created[T]` → 201, `actions.Accepted[T]` → 202. Returning any other value
 encodes as 200. For full control, return `actions.Response[T]` to set a custom status
-and response headers (e.g. `Cache-Control`/`ETag`), or `actions.Page[T]` for a
-conventional cursor-paginated list body.
+and response headers (e.g. `Cache-Control`/`ETag`), `actions.Page[T]` for a
+conventional cursor-paginated list body, or `actions.List[T]` for a non-paginated
+collection — `{"items": [...], "meta": {"total": N}}`. Build the latter with
+`actions.NewList(items)`, which sets the total and normalizes a nil slice to `[]`:
+
+```go
+Handle: func(ctx context.Context, _ listReq) (actions.List[user], error) {
+    return actions.NewList(store.all()), nil // 200 {"items":[...],"meta":{"total":N}}
+}
+```
+
+Path, query, and header parameters bind by struct tag (`path:`, `query:`,
+`header:`). Scalars convert automatically — `string`, `bool`, the integer and
+float kinds, and `time.Time` (parsed as RFC3339 or a bare `2006-01-02` date; a
+malformed value yields a 422). Any of these may be a pointer, so an absent
+optional parameter stays `nil` rather than a zero value:
+
+```go
+type listReq struct {
+    Active *bool      `json:"-" query:"active"` // nil when ?active= is absent
+    Since  *time.Time `json:"-" query:"since"`  // RFC3339; 422 if malformed
+    Limit  int        `json:"-" query:"limit" validate:"max=100"`
+}
+```
 
 ### 2. Register, freeze, and mount
 
