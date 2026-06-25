@@ -344,7 +344,7 @@ Wire observability with one hook:
 ```go
 reg := actions.NewRegistry(actions.WithObserver(func(o actions.Observation) {
     slog.Info("request",
-        "action", o.ActionID, "status", o.Status,
+        "action", o.ActionID, "status", o.Status, "request_id", o.RequestID,
         "ms", o.Duration.Milliseconds(), "err", o.Err)
 }))
 ```

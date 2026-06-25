@@ -230,7 +230,8 @@ func TestObserver(t *testing.T) {
 		assert.Equal(t, http.StatusAccepted, ob.Status)
 		assert.Equal(t, http.MethodPost, ob.Method)
 		assert.Positive(t, ob.Duration)
-		assert.NoError(t, ob.Err)
+		require.NoError(t, ob.Err)
+		assert.NotEmpty(t, ob.RequestID, "the observation must carry the request correlation id")
 	})
 
 	t.Run("a panic is observed as a 500 with a non-nil error", func(t *testing.T) {

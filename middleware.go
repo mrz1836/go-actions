@@ -27,9 +27,13 @@ type Observation struct {
 	ActionID string
 	Method   string
 	Path     string
-	Status   int
-	Duration time.Duration
-	Err      error
+	// RequestID is the request correlation id (the same value carried by the
+	// error envelope and echoed on the X-Request-ID response header), so access
+	// logs and metrics emitted from an observer correlate with the request.
+	RequestID string
+	Status    int
+	Duration  time.Duration
+	Err       error
 }
 
 // ObserveFunc receives one Observation per handled action request. Install one
@@ -124,18 +128,22 @@ func (r *Registry) recoverMiddleware(next http.Handler) http.Handler {
 func (r *Registry) observeMiddleware(actionID, method, path string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			// The request id is set by the outer requestIDMiddleware, so it is
+			// already on the inherited context; capture it before wrapping.
+			reqID := RequestIDFromContext(req.Context())
 			st := &observeState{}
 			req = req.WithContext(context.WithValue(req.Context(), observeStateKey, st))
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			start := time.Now()
 			next.ServeHTTP(rec, req)
 			r.observer(Observation{
-				ActionID: actionID,
-				Method:   method,
-				Path:     path,
-				Status:   rec.status,
-				Duration: time.Since(start),
-				Err:      st.err,
+				ActionID:  actionID,
+				Method:    method,
+				Path:      path,
+				RequestID: reqID,
+				Status:    rec.status,
+				Duration:  time.Since(start),
+				Err:       st.err,
 			})
 		})
 	}
