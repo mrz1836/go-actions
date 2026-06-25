@@ -14,7 +14,7 @@ Any released version of **go-actions** that is not marked as deprecated is activ
 If you’ve found a security issue, **please don’t open a public issue or PR**.
 
 Instead, send a private email to:
-📧 [atlas@mrz1818.com](mailto:atlas@mrz1818.com)
+📧 [go-actions@mrz1818.com](mailto:go-actions@mrz1818.com)
 
 Include the following:
 
