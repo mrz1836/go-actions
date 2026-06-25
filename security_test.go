@@ -57,6 +57,38 @@ func TestOpenAPI_Security(t *testing.T) {
 	assert.Equal(t, "admin", scopes[0])
 }
 
+func TestOpenAPI_SecurityInheritAndPublicOverride(t *testing.T) {
+	t.Parallel()
+	reg := actions.NewRegistry(
+		actions.WithSecurityScheme("BearerAuth", actions.BearerAuth("JWT")),
+		actions.WithSecurity(actions.SecurityRequirement{"BearerAuth": nil}),
+	)
+
+	// A nil Security inherits the registry-wide default (no per-op security key).
+	inherit := pingAction() // POST /ping
+	actions.Register(reg, inherit)
+
+	// An explicitly empty Security marks the operation public: "security: []".
+	public := panicAction() // POST /panic
+	public.Security = []actions.SecurityRequirement{}
+	actions.Register(reg, public)
+
+	reg.Freeze()
+
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+	paths, _ := doc["paths"].(map[string]any)
+
+	inheritOp, _ := paths["/ping"].(map[string]any)["post"].(map[string]any)
+	_, hasSecurity := inheritOp["security"]
+	assert.False(t, hasSecurity, "a nil Security must omit the operation security key (inherit global)")
+
+	publicOp, _ := paths["/panic"].(map[string]any)["post"].(map[string]any)
+	publicSec, ok := publicOp["security"].([]any)
+	require.True(t, ok, "an explicitly empty Security must emit a security key")
+	assert.Empty(t, publicSec, "an explicitly empty Security must emit security: [] (public)")
+}
+
 func TestOpenAPI_ServersDeprecatedVersion(t *testing.T) {
 	t.Parallel()
 	reg := actions.NewRegistry(

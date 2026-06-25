@@ -31,7 +31,11 @@ type Action[Req, Resp any] struct {
 	Deprecated bool
 	// Security lists the security requirements for this operation, overriding any
 	// registry-wide WithSecurity for this action. Each entry maps a scheme name
-	// (declared via WithSecurityScheme) to its required scopes.
+	// (declared via WithSecurityScheme) to its required scopes. A nil slice
+	// inherits the registry-wide default; a non-nil slice overrides it, and an
+	// explicitly empty slice ([]SecurityRequirement{}) marks the operation public
+	// — it emits "security: []" so the operation opts out of any global
+	// requirement.
 	Security []SecurityRequirement
 	// Timeout, when > 0, bounds the handler with a context deadline; a handler
 	// that honors ctx and overruns yields a 504.

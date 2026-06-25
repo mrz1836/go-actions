@@ -105,7 +105,10 @@ func buildOperation(sb *schemaBuilder, a anyAction) map[string]any {
 	if len(a.tags) > 0 {
 		op["tags"] = a.tags
 	}
-	if len(a.security) > 0 {
+	// A nil Security inherits the registry-wide default; a non-nil Security
+	// overrides it — including an explicitly empty slice, which emits "security:
+	// []" to mark the operation public (opting out of any global requirement).
+	if a.security != nil {
 		op["security"] = securityToList(a.security)
 	}
 	if params := buildParameters(sb, a.reqType); len(params) > 0 {
