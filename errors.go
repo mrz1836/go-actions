@@ -8,16 +8,24 @@ import (
 )
 
 // Stable, transport-level error codes. These are generic HTTP error codes with
-// no domain coupling; a custom ErrorMapper may emit any code it likes.
+// no domain coupling; a custom ErrorMapper may emit any code it likes. The
+// framework itself emits only CodeValidation, CodeBadRequest, CodeNotFound,
+// CodeInternal, CodeMethodNotAllowed, CodePayloadTooLarge, and CodeTimeout; the
+// remaining codes are provided as a stable vocabulary for ErrorMappers and
+// handlers so services across the ecosystem agree on the wire spelling.
 const (
-	CodeValidation       = "VALIDATION_ERROR"
-	CodeBadRequest       = "BAD_REQUEST"
-	CodeNotFound         = "NOT_FOUND"
-	CodeConflict         = "CONFLICT"
-	CodeInternal         = "INTERNAL_ERROR"
-	CodeMethodNotAllowed = "METHOD_NOT_ALLOWED"
-	CodePayloadTooLarge  = "PAYLOAD_TOO_LARGE"
-	CodeTimeout          = "TIMEOUT"
+	CodeValidation         = "VALIDATION_ERROR"
+	CodeBadRequest         = "BAD_REQUEST"
+	CodeUnauthorized       = "UNAUTHORIZED"
+	CodeForbidden          = "FORBIDDEN"
+	CodeNotFound           = "NOT_FOUND"
+	CodeConflict           = "CONFLICT"
+	CodePayloadTooLarge    = "PAYLOAD_TOO_LARGE"
+	CodeTooManyRequests    = "TOO_MANY_REQUESTS"
+	CodeInternal           = "INTERNAL_ERROR"
+	CodeMethodNotAllowed   = "METHOD_NOT_ALLOWED"
+	CodeTimeout            = "TIMEOUT"
+	CodeServiceUnavailable = "SERVICE_UNAVAILABLE"
 )
 
 // FieldError is one per-field validation failure.

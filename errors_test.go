@@ -145,3 +145,28 @@ func TestWriteError(t *testing.T) {
 		}
 	})
 }
+
+func TestErrorCodeValues(t *testing.T) {
+	t.Parallel()
+	// The wire spelling of each code is part of the public contract — pin it so a
+	// rename is a deliberate, breaking change rather than a silent one.
+	cases := map[string]string{
+		CodeValidation:         "VALIDATION_ERROR",
+		CodeBadRequest:         "BAD_REQUEST",
+		CodeUnauthorized:       "UNAUTHORIZED",
+		CodeForbidden:          "FORBIDDEN",
+		CodeNotFound:           "NOT_FOUND",
+		CodeConflict:           "CONFLICT",
+		CodePayloadTooLarge:    "PAYLOAD_TOO_LARGE",
+		CodeTooManyRequests:    "TOO_MANY_REQUESTS",
+		CodeInternal:           "INTERNAL_ERROR",
+		CodeMethodNotAllowed:   "METHOD_NOT_ALLOWED",
+		CodeTimeout:            "TIMEOUT",
+		CodeServiceUnavailable: "SERVICE_UNAVAILABLE",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("code value = %q, want %q", got, want)
+		}
+	}
+}
