@@ -3,11 +3,13 @@ package actions
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -90,6 +92,22 @@ func decodeBody[Req any](r *http.Request, req *Req) error {
 	return nil
 }
 
+// errInvalidTime signals that a time-typed parameter could not be parsed.
+var errInvalidTime = errors.New("invalid time value")
+
+// parseTimeValue parses a query/path/header time parameter, accepting RFC3339
+// (with or without sub-second precision) and a bare calendar date (2006-01-02,
+// interpreted as UTC midnight). It is the time counterpart to the strconv
+// conversions in setScalar.
+func parseTimeValue(raw string) (time.Time, error) {
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("%w: %q", errInvalidTime, raw)
+}
+
 // hasTag reports whether field f carries a non-empty struct tag named key.
 func hasTag(f reflect.StructField, key string) bool {
 	v, ok := f.Tag.Lookup(key)
@@ -105,9 +123,29 @@ func tagName(f reflect.StructField) string {
 	return f.Name
 }
 
-// setScalar converts the string raw into the scalar field fv.
+// setScalar converts the string raw into the scalar field fv. It transparently
+// allocates and follows a pointer field — so optional query/header parameters
+// can be typed as *bool, *int, *time.Time, etc. — and binds an RFC3339 (or
+// bare calendar date) string into a time.Time field.
 func setScalar(fv reflect.Value, raw, name string) error {
 	if raw == "" {
+		return nil
+	}
+	if fv.Kind() == reflect.Pointer {
+		if fv.IsNil() {
+			fv.Set(reflect.New(fv.Type().Elem()))
+		}
+		return setScalar(fv.Elem(), raw, name)
+	}
+	if fv.Type() == timeType {
+		t, err := parseTimeValue(raw)
+		if err != nil {
+			return &APIError{
+				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
+				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be an RFC3339 timestamp"}},
+			}
+		}
+		fv.Set(reflect.ValueOf(t))
 		return nil
 	}
 	switch fv.Kind() { //nolint:exhaustive // unhandled kinds fall through to the default

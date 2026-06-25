@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -202,6 +203,87 @@ func TestDecodeRequest(t *testing.T) {
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 			t.Fatalf("error = %v, want 422 *APIError", err)
+		}
+	})
+
+	t.Run("time.Time query binds from RFC3339", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			From time.Time `json:"-" query:"from"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?from=2026-06-24T10:30:00Z", nil)
+		got, err := decodeRequest[req](r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got.From.Equal(time.Date(2026, 6, 24, 10, 30, 0, 0, time.UTC)) {
+			t.Fatalf("decoded = %+v", got)
+		}
+	})
+
+	t.Run("time.Time query binds from a bare date", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Day time.Time `json:"-" query:"day"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?day=2026-06-24", nil)
+		got, err := decodeRequest[req](r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got.Day.Equal(time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC)) {
+			t.Fatalf("decoded = %+v", got)
+		}
+	})
+
+	t.Run("bad time.Time query returns 422", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			From time.Time `json:"-" query:"from"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?from=not-a-time", nil)
+		_, err := decodeRequest[req](r)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
+			t.Fatalf("error = %v, want 422 *APIError", err)
+		}
+	})
+
+	t.Run("pointer query params allocate and bind", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Active *bool      `json:"-" query:"active"`
+			Limit  *int       `json:"-" query:"limit"`
+			From   *time.Time `json:"-" query:"from"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?active=false&limit=10&from=2026-06-24T00:00:00Z", nil)
+		got, err := decodeRequest[req](r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Active == nil || *got.Active != false {
+			t.Fatalf("Active = %v", got.Active)
+		}
+		if got.Limit == nil || *got.Limit != 10 {
+			t.Fatalf("Limit = %v", got.Limit)
+		}
+		if got.From == nil || !got.From.Equal(time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC)) {
+			t.Fatalf("From = %v", got.From)
+		}
+	})
+
+	t.Run("absent pointer query params stay nil", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Active *bool `json:"-" query:"active"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+		got, err := decodeRequest[req](r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Active != nil {
+			t.Fatalf("Active = %v, want nil", got.Active)
 		}
 	})
 
