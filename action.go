@@ -82,6 +82,32 @@ type Page[T any] struct {
 	HasMore    bool   `json:"has_more"`
 }
 
+// ListMeta carries count metadata for a List response body.
+type ListMeta struct {
+	// Total is the number of items in the result set.
+	Total int `json:"total"`
+}
+
+// List is a conventional non-paginated collection body: a slice of items plus a
+// metadata block carrying the total count. Like Page it is an ordinary 200
+// response body, offered so simple list endpoints across services share one
+// wire shape — {"items": [...], "meta": {"total": N}}. Use Page instead when the
+// collection is cursor-paginated. Construct it with NewList.
+type List[T any] struct {
+	Items []T      `json:"items"`
+	Meta  ListMeta `json:"meta"`
+}
+
+// NewList wraps items in a List with Meta.Total set to len(items). A nil slice
+// is normalized to an empty slice so the body encodes "items": [] rather than
+// "items": null.
+func NewList[T any](items []T) List[T] {
+	if items == nil {
+		items = []T{}
+	}
+	return List[T]{Items: items, Meta: ListMeta{Total: len(items)}}
+}
+
 // anyAction is the type-erased registry entry: action metadata, the reflected
 // request/response types for schema generation, and the built handler.
 type anyAction struct {
