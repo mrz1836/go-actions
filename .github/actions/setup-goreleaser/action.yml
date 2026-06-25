@@ -72,7 +72,7 @@ runs:
     - name: 💾 Restore goreleaser binary cache
       id: goreleaser-cache
       if: steps.check-existing.outputs.exists != 'true'
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
       with:
         path: |
           ~/.cache/goreleaser-bin
@@ -105,7 +105,7 @@ runs:
     # --------------------------------------------------------------------
     - name: ✅ Install GoReleaser (cache miss)
       if: steps.check-existing.outputs.exists != 'true' && steps.goreleaser-cache.outputs.cache-hit != 'true'
-      uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
+      uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
       with:
         distribution: goreleaser
         version: ${{ inputs.goreleaser-version }}

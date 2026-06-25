@@ -45,7 +45,7 @@ Files load in sorted order. Variables in later files override earlier ones:
 GO_PRIMARY_VERSION=1.24.x
 
 # 90-project.env (loaded later, wins)
-GO_PRIMARY_VERSION=1.25.x  # This value is used
+GO_PRIMARY_VERSION=1.23.x  # This value is used
 ```
 
 <br>
