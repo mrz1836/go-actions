@@ -3,9 +3,9 @@ module github.com/mrz1836/go-actions
 go 1.25.8
 
 require (
-	github.com/go-chi/chi/v5 v5.3.0
+	github.com/go-chi/chi/v5 v5.3.1
 	github.com/google/uuid v1.6.0
-	github.com/mrz1836/go-foundation v0.2.1
+	github.com/mrz1836/go-foundation v0.3.3
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -26,5 +26,5 @@ require (
 	golang.org/x/text v0.38.0 // indirect
 	gorm.io/datatypes v1.2.7 // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
-	gorm.io/gorm v1.31.1 // indirect
+	gorm.io/gorm v1.31.2 // indirect
 )
