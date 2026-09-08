@@ -512,7 +512,7 @@ magex help
 
 ## 🧪 Examples & Tests
 
-All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-actions/actions) and use [Go version 1.25.x](https://go.dev/doc/go1.25). View the [configuration file](.github/workflows/fortress.yml).
+All unit tests run via [GitHub Actions](https://github.com/mrz1836/go-actions/actions) and use [Go version 1.26.x](https://go.dev/doc/go1.26). View the [configuration file](.github/workflows/fortress.yml).
 
 The [`examples/`](examples) directory contains a runnable pet-store API:
 
