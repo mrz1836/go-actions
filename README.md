@@ -203,6 +203,21 @@ Handle: func(ctx context.Context, _ listReq) (actions.List[user], error) {
 }
 ```
 
+For cursor-paginated endpoints, `actions.ClampLimit(limit, def, ceiling)` normalizes a
+requested page size into `[1, ceiling]` (with your own bounds), and
+`actions.Paginate(rows, limit, cursorOf)` trims a `limit+1` fetch down to one page,
+sets `HasMore`, and derives `NextCursor` from the last kept row. Cursor encoding
+stays yours — `cursorOf` returns whatever opaque string your surface uses — so the
+helper adds no dependency:
+
+```go
+Handle: func(ctx context.Context, req listReq) (actions.Page[user], error) {
+    limit := actions.ClampLimit(req.Limit, 25, 100)
+    rows := store.page(req.Cursor, limit+1) // fetch one extra to detect a next page
+    return actions.Paginate(rows, limit, func(u user) string { return u.Cursor }), nil
+}
+```
+
 Path, query, and header parameters bind by struct tag (`path:`, `query:`,
 `header:`). Scalars convert automatically — `string`, `bool`, the integer and
 float kinds, and `time.Time` (parsed as RFC3339 or a bare `2006-01-02` date; a
@@ -560,7 +575,7 @@ Run the Go benchmarks:
 magex bench
 ```
 
-> Benchmarks cover the hot path — request decoding, validation, and response encoding through the typed pipeline — plus the one-time OpenAPI contract generation.
+> Benchmarks cover the hot path — request decoding, validation, and response encoding through the typed pipeline — plus the list-pagination helpers (`ClampLimit` / `Paginate`) and the one-time OpenAPI contract generation.
 
 <br/>
 
