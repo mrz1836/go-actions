@@ -312,6 +312,17 @@ directly) and maps every other error to a redacted 500, ensuring internal detail
 reaches the wire. The error envelope is always
 `{"error": ..., "code": ..., "request_id": ...}`.
 
+The contract documents the envelope as the `Error` component: `error` and `code` are
+required, and `request_id` is optional (it is omitted when empty). To give generated
+clients a closed set of codes, list the ones your mapper and middleware emit:
+
+```go
+reg := actions.NewRegistry(actions.WithErrorCodes("IDENTITY_CONFLICT", "STEP_UP_REQUIRED"))
+```
+
+`code` then carries an `enum` of the built-in `Code*` constants plus your codes, sorted
+and de-duplicated. Without `WithErrorCodes`, `code` stays an open string.
+
 **foundationx adapter** — the optional `foundationx` sub-package provides a ready-made
 `ErrorMapper` that wires the [`go-foundation`](https://github.com/mrz1836/go-foundation)
 error model (`*ValidationError` → 422, `ErrNotFound` → 404). It lives in its own package
@@ -333,6 +344,7 @@ reg := actions.NewRegistry(actions.WithErrorMapper(foundationx.NewErrorMapper())
 | ------------------------------- | ------------------------------------------------------------------- |
 | `WithInfo(title, desc, version)`| Sets the OpenAPI `info` block; the title also names the `_actions` index. |
 | `WithErrorMapper(mapper)`       | Installs a custom error mapper (replaces the default generic one).  |
+| `WithErrorCodes(codes...)`      | Enumerates `Error.code` in the contract: the built-in `Code*` constants plus `codes`. |
 | `WithStripPrefix(prefix)`       | Strips a namespace prefix from each action's `Path` when routing (e.g. when the registry is mounted under that prefix). |
 | `WithMiddleware(mw...)`         | Registry-wide middleware applied to every route (actions, self-docs, `404`/`405`). |
 | `WithMaxBodyBytes(n)`           | Caps the request body (default 1 MiB; `0` disables). Over-limit ⇒ `413`. |
@@ -425,6 +437,59 @@ reject emptiness.
 For rules a tag can't express, a request type may implement `Validatable`
 (`Validate() error`); it runs after the tag rules and its field details merge into the
 `422` response.
+
+</details>
+
+<details>
+<summary><strong><code>Schema generation: requests vs responses</code></strong></summary>
+<br/>
+
+Request and response schemas follow what each side of the wire can rely on:
+
+| Field                                   | Request schema                     | Response schema                         |
+| --------------------------------------- | ---------------------------------- | --------------------------------------- |
+| `validate:"required"`                   | required                           | required                                |
+| json tag without `omitempty`/`omitzero` | optional                           | required (the encoder always writes it) |
+| json tag with `omitempty`/`omitzero`    | optional                           | optional                                |
+| pointer without `omitempty`/`omitzero`  | the pointee's schema               | required **and** nullable               |
+
+A nullable field uses the dialect's own form. In OpenAPI 3.1 it is a type array
+(`"type": ["string", "null"]`), or `"oneOf": [{"$ref": …}, {"type": "null"}]` for a
+named struct. In 3.0 (`WithOpenAPIVersion("3.0.3")`) it is `"nullable": true`, with a
+`$ref` wrapped in `allOf`. A schema that already accepts anything, such as an `any` or
+`json.RawMessage` field, stays `{}`. So this view:
+
+```go
+type UserView struct {
+	ID          string  `json:"id"`                     // required
+	DisplayName *string `json:"display_name"`           // required, string or null
+	Avatar      string  `json:"avatar_url,omitempty"`   // optional
+}
+```
+
+generates `required: ["id", "display_name"]` and
+`display_name: {"type": ["string", "null"]}`, which `openapi-typescript` renders as
+`{ id: string; display_name: string | null; avatar_url?: string }`.
+
+**Shared types.** A named struct used by both a request and a response can need two
+schemas. When they differ (directly, or through a nested type that differs), the
+response schema keeps the type's name (`UserView`) and the request schema is emitted as
+`UserViewInput`, and request `$ref`s point at it. When they are identical, one component
+serves both. Naming another type `<Name>Input` while `<Name>` needs the split panics at
+`Freeze()`.
+
+**Opaque JSON objects.** A field that carries an arbitrary JSON object, such as a
+`json.RawMessage` protocol payload, can be documented as an object instead of `{}`:
+
+```go
+type FinishRequest struct {
+	Credential json.RawMessage `json:"credential" openapi:"type=object"`
+}
+```
+
+The override replaces the generated schema with
+`{"type": "object", "additionalProperties": true}` (`{ [key: string]: unknown }` in
+TypeScript). Validate-tag constraints are not applied to an overridden field.
 
 </details>
 

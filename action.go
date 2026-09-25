@@ -144,6 +144,9 @@ type Registry struct {
 	info        openAPIInfo
 	errorMapper ErrorMapper
 	stripPrefix string
+	// errorCodes are the extra codes from WithErrorCodes; nil when it was not
+	// used, which leaves the Error schema's code un-enumerated.
+	errorCodes []string
 
 	// runtime configuration
 	middleware       []Middleware
