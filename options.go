@@ -50,6 +50,24 @@ func WithErrorMapper(m ErrorMapper) Option {
 	}
 }
 
+// WithErrorCodes enumerates the error codes the API can emit on the OpenAPI
+// Error schema, so generated clients see code as a string-literal union: code
+// gains an enum of the built-in Code* constants plus codes, sorted and
+// de-duplicated. Repeated calls accumulate; empty codes are ignored. Without
+// this option code stays an open string.
+func WithErrorCodes(codes ...string) Option {
+	return func(r *Registry) {
+		if r.errorCodes == nil {
+			r.errorCodes = []string{}
+		}
+		for _, code := range codes {
+			if code != "" {
+				r.errorCodes = append(r.errorCodes, code)
+			}
+		}
+	}
+}
+
 // WithStripPrefix configures a namespace prefix to strip from each action's
 // declared Path when building the router. Use it when the Registry is mounted
 // under that same prefix (e.g. WithStripPrefix("/v1") for a Registry mounted at

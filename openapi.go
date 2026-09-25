@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -22,7 +23,12 @@ func (r *Registry) buildArtifacts() {
 // derives the YAML serialization from the same structure. The info block is
 // taken from the registry's configured (or default) OpenAPI info.
 func (r *Registry) buildOpenAPI() {
+	version := r.openapiVersion
+	if version == "" {
+		version = defaultOpenAPIVersion
+	}
 	sb := newSchemaBuilder()
+	sb.nullableKeyword = strings.HasPrefix(version, "3.0.")
 	paths := map[string]any{}
 	for _, a := range r.actions {
 		pathItem, ok := paths[a.path].(map[string]any)
@@ -32,13 +38,10 @@ func (r *Registry) buildOpenAPI() {
 		pathItem[strings.ToLower(a.method)] = buildOperation(sb, a)
 		paths[a.path] = pathItem
 	}
-	sb.components["Error"] = errorSchema()
+	schemas := sb.components()
+	schemas["Error"] = errorSchema(r.errorCodeEnum())
 
-	version := r.openapiVersion
-	if version == "" {
-		version = defaultOpenAPIVersion
-	}
-	components := map[string]any{"schemas": sb.components}
+	components := map[string]any{"schemas": schemas}
 	if len(r.securitySchemes) > 0 {
 		schemes := make(map[string]any, len(r.securitySchemes))
 		for name, scheme := range r.securitySchemes {
@@ -135,7 +138,7 @@ func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 		if in == "" {
 			continue
 		}
-		schema := sb.schemaFor(f.Type)
+		schema := sb.schemaFor(f.Type, modeRequest)
 		applyConstraints(schema, f.Tag.Get("validate"))
 		params = append(params, map[string]any{
 			"name":     name,
@@ -166,7 +169,7 @@ func buildRequestBody(sb *schemaBuilder, reqType reflect.Type) map[string]any {
 	if reqType.Kind() != reflect.Struct {
 		return nil
 	}
-	schema := sb.structSchema(reqType)
+	schema := sb.structSchema(reqType, modeRequest)
 	props, _ := schema["properties"].(map[string]any)
 	if len(props) == 0 {
 		return nil
@@ -205,14 +208,32 @@ func jsonContent(schema map[string]any) map[string]any {
 	}
 }
 
+// errorCodeEnum returns the sorted, de-duplicated union of the built-in codes
+// and those passed to WithErrorCodes, or nil when WithErrorCodes was not used.
+func (r *Registry) errorCodeEnum() []string {
+	if r.errorCodes == nil {
+		return nil
+	}
+	codes := append(builtinErrorCodes(), r.errorCodes...)
+	slices.Sort(codes)
+	return slices.Compact(codes)
+}
+
 // errorSchema is the JSON Schema of the framework's error response envelope.
-func errorSchema() map[string]any {
+// The encoder always writes error and code, so both are required; request_id is
+// omitted when empty. A non-nil codes list becomes the enum of code.
+func errorSchema(codes []string) map[string]any {
+	code := map[string]any{schemaTypeKey: "string"}
+	if codes != nil {
+		code["enum"] = codes
+	}
 	return map[string]any{
 		schemaTypeKey: "object",
 		"properties": map[string]any{
 			"error":      map[string]any{schemaTypeKey: "string"},
-			"code":       map[string]any{schemaTypeKey: "string"},
+			"code":       code,
 			"request_id": map[string]any{schemaTypeKey: "string"},
 		},
+		"required": []string{"error", "code"},
 	}
 }

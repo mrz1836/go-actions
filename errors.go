@@ -28,6 +28,15 @@ const (
 	CodeServiceUnavailable = "SERVICE_UNAVAILABLE"
 )
 
+// builtinErrorCodes returns the framework's Code* vocabulary.
+func builtinErrorCodes() []string {
+	return []string{
+		CodeValidation, CodeBadRequest, CodeUnauthorized, CodeForbidden,
+		CodeNotFound, CodeConflict, CodePayloadTooLarge, CodeTooManyRequests,
+		CodeInternal, CodeMethodNotAllowed, CodeTimeout, CodeServiceUnavailable,
+	}
+}
+
 // FieldError is one per-field validation failure.
 type FieldError struct {
 	Field   string `json:"field"`

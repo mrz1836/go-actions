@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -162,6 +163,78 @@ func TestOpenAPI_ParametersResponsesAndErrors(t *testing.T) {
 	noContent, _ := delResponses["204"].(map[string]any)
 	_, hasContent := noContent["content"]
 	assert.False(t, hasContent, "204 must not carry a response body")
+}
+
+// errorComponent returns the Error component schema of a frozen registry.
+func errorComponent(t *testing.T, reg *actions.Registry) map[string]any {
+	t.Helper()
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+	components, _ := doc["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	errSchema, ok := schemas["Error"].(map[string]any)
+	require.True(t, ok, "Error component missing")
+	return errSchema
+}
+
+// errorCodeEnum returns the enum of the Error schema's code property, or nil.
+func errorCodeEnum(t *testing.T, errSchema map[string]any) []string {
+	t.Helper()
+	props, _ := errSchema["properties"].(map[string]any)
+	code, _ := props["code"].(map[string]any)
+	raw, ok := code["enum"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, _ := v.(string)
+		out = append(out, s)
+	}
+	return out
+}
+
+// builtinCodes is the framework's Code* vocabulary, sorted.
+func builtinCodes() []string {
+	return []string{
+		actions.CodeBadRequest, actions.CodeConflict, actions.CodeForbidden,
+		actions.CodeInternal, actions.CodeMethodNotAllowed, actions.CodeNotFound,
+		actions.CodePayloadTooLarge, actions.CodeServiceUnavailable, actions.CodeTimeout,
+		actions.CodeTooManyRequests, actions.CodeUnauthorized, actions.CodeValidation,
+	}
+}
+
+func TestOpenAPI_ErrorSchema(t *testing.T) {
+	t.Parallel()
+
+	t.Run("error and code are always required", func(t *testing.T) {
+		t.Parallel()
+		errSchema := errorComponent(t, frozenPingRegistry(t))
+		assert.Equal(t, []any{"error", "code"}, errSchema["required"])
+	})
+
+	t.Run("code is an open string without WithErrorCodes", func(t *testing.T) {
+		t.Parallel()
+		assert.Nil(t, errorCodeEnum(t, errorComponent(t, frozenPingRegistry(t))))
+	})
+
+	t.Run("WithErrorCodes enumerates the built-ins plus the given codes", func(t *testing.T) {
+		t.Parallel()
+		reg := frozenPingRegistry(t,
+			actions.WithErrorCodes("ZETA_CODE", actions.CodeNotFound, "ALPHA_CODE", ""),
+			actions.WithErrorCodes("ZETA_CODE", "MIDDLE_CODE"),
+		)
+		want := append(builtinCodes(), "ALPHA_CODE", "MIDDLE_CODE", "ZETA_CODE")
+		slices.Sort(want)
+		assert.Equal(t, want, errorCodeEnum(t, errorComponent(t, reg)),
+			"enum must be the sorted, de-duplicated union, ignoring empty codes")
+	})
+
+	t.Run("WithErrorCodes with no codes enumerates the built-ins", func(t *testing.T) {
+		t.Parallel()
+		reg := frozenPingRegistry(t, actions.WithErrorCodes())
+		assert.Equal(t, builtinCodes(), errorCodeEnum(t, errorComponent(t, reg)))
+	})
 }
 
 func TestOpenAPI_JSONYAMLParity(t *testing.T) {
