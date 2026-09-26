@@ -52,6 +52,23 @@ type StatusDoc struct {
 	Code        int
 	Description string
 	Error       bool
+	// Headers documents the response headers this outcome sets, such as
+	// Retry-After on a 429. Each becomes an entry in the response's OpenAPI
+	// headers object. Optional.
+	Headers []HeaderDoc
+}
+
+// HeaderDoc documents one response header of an action outcome.
+type HeaderDoc struct {
+	// Name is the header name as written on the wire, e.g. "Retry-After".
+	Name string
+	// Description explains the header's value.
+	Description string
+	// Type is the JSON Schema type of the value ("string", "integer", ...);
+	// empty means "string".
+	Type string
+	// Required marks a header the outcome always sets.
+	Required bool
 }
 
 // Empty is a Resp marker — the encoder emits 204 No Content.
@@ -354,6 +371,7 @@ func (r *Registry) validateActions() {
 		case len(a.statuses) == 0:
 			panic(fmt.Sprintf("actions: action %q documents no Statuses", a.id))
 		}
+		validateHeaderDocs(a)
 		if seenID[a.id] {
 			panic(fmt.Sprintf("actions: duplicate action ID %q", a.id))
 		}
@@ -364,6 +382,17 @@ func (r *Registry) validateActions() {
 			panic(fmt.Sprintf("actions: duplicate route %q", route))
 		}
 		seenRoute[route] = true
+	}
+}
+
+// validateHeaderDocs panics on a documented response header without a name.
+func validateHeaderDocs(a anyAction) {
+	for _, sd := range a.statuses {
+		for _, h := range sd.Headers {
+			if h.Name == "" {
+				panic(fmt.Sprintf("actions: action %q documents a %d response header with an empty Name", a.id, sd.Code))
+			}
+		}
 	}
 }
 

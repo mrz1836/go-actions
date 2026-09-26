@@ -196,9 +196,33 @@ func buildResponses(sb *schemaBuilder, a anyAction) map[string]any {
 		case hasBody && bodySchema != nil:
 			resp["content"] = jsonContent(bodySchema)
 		}
+		if len(sd.Headers) > 0 {
+			resp["headers"] = responseHeaders(sd.Headers)
+		}
 		responses[strconv.Itoa(sd.Code)] = resp
 	}
 	return responses
+}
+
+// responseHeaders builds a response's OpenAPI headers object from its
+// HeaderDocs. An empty Type is documented as a string.
+func responseHeaders(docs []HeaderDoc) map[string]any {
+	headers := make(map[string]any, len(docs))
+	for _, h := range docs {
+		typ := h.Type
+		if typ == "" {
+			typ = "string"
+		}
+		header := map[string]any{
+			"description": h.Description,
+			"schema":      map[string]any{schemaTypeKey: typ},
+		}
+		if h.Required {
+			header["required"] = true
+		}
+		headers[h.Name] = header
+	}
+	return headers
 }
 
 // jsonContent wraps a schema in an application/json content object.

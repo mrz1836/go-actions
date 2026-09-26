@@ -171,6 +171,18 @@ func TestRegistry(t *testing.T) {
 				},
 			},
 			{
+				name: "response header with an empty name",
+				run: func() {
+					reg := actions.NewRegistry()
+					a := pingAction()
+					a.Statuses = []actions.StatusDoc{
+						{Code: http.StatusTooManyRequests, Error: true, Headers: []actions.HeaderDoc{{Description: "no name"}}},
+					}
+					actions.Register(reg, a)
+					reg.Freeze()
+				},
+			},
+			{
 				name: "Handler called before Freeze",
 				run: func() {
 					reg := actions.NewRegistry()

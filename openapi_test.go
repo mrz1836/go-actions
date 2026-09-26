@@ -165,6 +165,53 @@ func TestOpenAPI_ParametersResponsesAndErrors(t *testing.T) {
 	assert.False(t, hasContent, "204 must not carry a response body")
 }
 
+func TestOpenAPI_ResponseHeaders(t *testing.T) {
+	t.Parallel()
+	a := getItemAction()
+	a.Statuses = []actions.StatusDoc{
+		{Code: http.StatusCreated, Description: "created"},
+		{
+			Code: http.StatusTooManyRequests, Description: "slow down", Error: true,
+			Headers: []actions.HeaderDoc{
+				{Name: "Retry-After", Description: "Seconds to wait before retrying.", Type: "integer", Required: true},
+				{Name: "X-RateLimit-Policy", Description: "The limit that tripped."},
+			},
+		},
+	}
+	reg := actions.NewRegistry()
+	actions.Register(reg, a)
+	reg.Freeze()
+
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+	paths, _ := doc["paths"].(map[string]any)
+	pathItem, _ := paths["/items/{id}"].(map[string]any)
+	get, _ := pathItem["get"].(map[string]any)
+	responses, _ := get["responses"].(map[string]any)
+
+	tooMany, _ := responses["429"].(map[string]any)
+	headers, ok := tooMany["headers"].(map[string]any)
+	require.True(t, ok, "the 429 response documents its headers")
+	assert.Equal(t, map[string]any{
+		"description": "Seconds to wait before retrying.",
+		"required":    true,
+		"schema":      map[string]any{"type": "integer"},
+	}, headers["Retry-After"])
+	assert.Equal(t, map[string]any{
+		"description": "The limit that tripped.",
+		"schema":      map[string]any{"type": "string"},
+	}, headers["X-RateLimit-Policy"], "an empty Type defaults to string; required is omitted when false")
+
+	// The error body is still documented alongside the headers.
+	content, _ := tooMany["content"].(map[string]any)
+	assert.Contains(t, content, "application/json")
+
+	// A status without Headers gets no headers object.
+	created, _ := responses["201"].(map[string]any)
+	_, hasHeaders := created["headers"]
+	assert.False(t, hasHeaders)
+}
+
 // errorComponent returns the Error component schema of a frozen registry.
 func errorComponent(t *testing.T, reg *actions.Registry) map[string]any {
 	t.Helper()
