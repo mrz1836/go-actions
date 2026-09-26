@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/mrz1836/go-actions"
 	"github.com/mrz1836/go-actions/actiontest"
 )
@@ -240,11 +243,14 @@ var errBoom = errors.New("internal boom detail")
 // path through the registry-built handler.
 func boomAction() actions.Action[pingReq, pingResp] {
 	return actions.Action[pingReq, pingResp]{
-		ID:       "test.boom",
-		Method:   http.MethodPost,
-		Path:     "/boom",
-		Summary:  "Boom",
-		Statuses: []actions.StatusDoc{{Code: http.StatusInternalServerError, Description: "boom", Error: true}},
+		ID:      "test.boom",
+		Method:  http.MethodPost,
+		Path:    "/boom",
+		Summary: "Boom",
+		Statuses: []actions.StatusDoc{
+			{Code: http.StatusOK, Description: "ok"},
+			{Code: http.StatusInternalServerError, Description: "boom", Error: true},
+		},
 		Handle: func(_ context.Context, _ pingReq) (pingResp, error) {
 			return pingResp{}, errBoom
 		},
@@ -330,5 +336,164 @@ func TestRegistry_HandlerErrors(t *testing.T) {
 		if !strings.Contains(string(b), actions.CodeBadRequest) {
 			t.Fatalf("body = %s, want code %s", b, actions.CodeBadRequest)
 		}
+	})
+}
+
+// okHandle is a Handle returning Resp's zero value.
+func okHandle[Req, Resp any](context.Context, Req) (Resp, error) {
+	var zero Resp
+	return zero, nil
+}
+
+// freezeOne registers a single action and freezes the registry, returning the
+// panic value, or nil when Freeze succeeded.
+func freezeOne[Req, Resp any](a actions.Action[Req, Resp], opts ...actions.Option) (panicked any) {
+	defer func() { panicked = recover() }()
+	reg := actions.NewRegistry(opts...)
+	actions.Register(reg, a)
+	reg.Freeze()
+	return nil
+}
+
+func TestFreezeRejectsNilHandle(t *testing.T) {
+	got := freezeOne(actions.Action[pingReq, pingResp]{
+		ID: "test.nil", Method: http.MethodGet, Path: "/nil",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+	})
+	assert.Equal(t, `actions: action "test.nil" has a nil Handle`, got)
+}
+
+func TestRegisterUppercasesMethod(t *testing.T) {
+	t.Run("a lowercase method routes and documents as uppercase", func(t *testing.T) {
+		reg := actions.NewRegistry()
+		actions.Register(reg, actions.Action[struct{}, pingResp]{
+			ID: "test.lower", Method: "get", Path: "/lower", Summary: "Lower",
+			Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+			Handle:   okHandle[struct{}, pingResp],
+		})
+		srv := actiontest.NewServer(t, reg)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/lower", nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(reg.OpenAPIJSON()), `"get": {`)
+	})
+
+	t.Run("case variants of one method collide", func(t *testing.T) {
+		reg := actions.NewRegistry()
+		for _, m := range []string{"get", "GET"} {
+			actions.Register(reg, actions.Action[struct{}, pingResp]{
+				ID: "test." + m, Method: m, Path: "/dup",
+				Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+				Handle:   okHandle[struct{}, pingResp],
+			})
+		}
+		assert.PanicsWithValue(t, `actions: duplicate route "GET /dup" (actions "test.get" and "test.GET")`, reg.Freeze)
+	})
+}
+
+func TestFreezeRejectsRoutesCollidingAfterStripPrefix(t *testing.T) {
+	reg := actions.NewRegistry(actions.WithStripPrefix("/v1"))
+	for _, p := range []string{"/v1/pets", "/pets"} {
+		actions.Register(reg, actions.Action[struct{}, pingResp]{
+			ID: "test" + strings.ReplaceAll(p, "/", "."), Method: http.MethodGet, Path: p,
+			Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+			Handle:   okHandle[struct{}, pingResp],
+		})
+	}
+	assert.PanicsWithValue(t, `actions: duplicate route "GET /pets" (actions "test.v1.pets" and "test.pets")`, reg.Freeze)
+}
+
+func TestFreezeRequiresDocumentedSuccessStatus(t *testing.T) {
+	ok := func(code int) []actions.StatusDoc { return []actions.StatusDoc{{Code: code}} }
+	errOnly := func(code int) []actions.StatusDoc { return []actions.StatusDoc{{Code: code, Error: true}} }
+
+	tests := []struct {
+		name   string
+		freeze func() any
+		want   any
+	}{
+		{"Empty documents 204", func() any { return freezeEnvelope[actions.Empty](ok(204)) }, nil},
+		{
+			"Empty without 204", func() any { return freezeEnvelope[actions.Empty](ok(200)) },
+			`actions: action "test.status" responds 204 on success (Resp actions.Empty) but documents no non-error 204 StatusDoc`,
+		},
+		{
+			"Created without 201", func() any { return freezeEnvelope[actions.Created[pingResp]](ok(200)) },
+			`actions: action "test.status" responds 201 on success (Resp actions.Created[github.com/mrz1836/go-actions_test.pingResp]) but documents no non-error 201 StatusDoc`,
+		},
+		{
+			"Accepted without 202", func() any { return freezeEnvelope[actions.Accepted[pingResp]](ok(200)) },
+			`actions: action "test.status" responds 202 on success (Resp actions.Accepted[github.com/mrz1836/go-actions_test.pingResp]) but documents no non-error 202 StatusDoc`,
+		},
+		{
+			"a plain body without 200", func() any { return freezeEnvelope[pingResp](ok(201)) },
+			`actions: action "test.status" responds 200 on success (Resp actions_test.pingResp) but documents no non-error 200 StatusDoc`,
+		},
+		{
+			"success documented only as an error", func() any { return freezeEnvelope[pingResp](errOnly(200)) },
+			`actions: action "test.status" responds 200 on success (Resp actions_test.pingResp) but documents no non-error 200 StatusDoc`,
+		},
+		{"a pointer envelope is checked", func() any { return freezeEnvelope[*actions.Created[pingResp]](ok(201)) }, nil},
+		{"Response[T] is exempt", func() any { return freezeEnvelope[actions.Response[pingResp]](ok(299)) }, nil},
+		{"an interface Resp is exempt", func() any { return freezeEnvelope[any](ok(201)) }, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.freeze())
+		})
+	}
+}
+
+// freezeEnvelope freezes one action whose Resp is R with the given statuses.
+func freezeEnvelope[R any](statuses []actions.StatusDoc) any {
+	return freezeOne(actions.Action[struct{}, R]{
+		ID: "test.status", Method: http.MethodPost, Path: "/status",
+		Statuses: statuses, Handle: okHandle[struct{}, R],
+	})
+}
+
+func TestRegisterNonValueRequestTypes(t *testing.T) {
+	var gotPtr *pingReq
+	var gotInt int
+	reg := actions.NewRegistry()
+	actions.Register(reg, actions.Action[*pingReq, pingResp]{
+		ID: "test.ptr", Method: http.MethodPost, Path: "/ptr",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+		Handle: func(_ context.Context, req *pingReq) (pingResp, error) {
+			gotPtr = req
+			return pingResp{Greeting: "hi " + req.Name}, nil
+		},
+	})
+	actions.Register(reg, actions.Action[int, pingResp]{
+		ID: "test.int", Method: http.MethodPost, Path: "/int",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+		Handle: func(_ context.Context, req int) (pingResp, error) {
+			gotInt = req + 1
+			return pingResp{}, nil
+		},
+	})
+	srv := actiontest.NewServer(t, reg)
+
+	t.Run("a pointer request is decoded and validated", func(t *testing.T) {
+		resp := postJSON(t, srv.URL+"/ptr", `{"name":"ada"}`)
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		require.NotNil(t, gotPtr)
+		assert.Equal(t, "ada", gotPtr.Name)
+
+		bad := postJSON(t, srv.URL+"/ptr", `{}`)
+		defer func() { _ = bad.Body.Close() }()
+		assert.Equal(t, http.StatusUnprocessableEntity, bad.StatusCode)
+	})
+
+	t.Run("a non-struct request binds nothing", func(t *testing.T) {
+		resp := postJSON(t, srv.URL+"/int", `42`)
+		defer func() { _ = resp.Body.Close() }()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, 1, gotInt, "the handler receives the zero value")
 	})
 }

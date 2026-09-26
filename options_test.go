@@ -1,8 +1,12 @@
 package actions
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDefaultInfoIsNeutral(t *testing.T) {
@@ -96,4 +100,14 @@ func TestWithStripPrefixMountPath(t *testing.T) {
 			t.Fatalf("mountPath = %q, want /", got)
 		}
 	})
+}
+
+func TestBuildOpenAPIDefaultsAnEmptyVersion(t *testing.T) {
+	reg := NewRegistry()
+	reg.openapiVersion = "" // a zero-value field, as on a Registry built without NewRegistry
+	reg.Freeze()
+
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+	assert.Equal(t, defaultOpenAPIVersion, doc["openapi"])
 }

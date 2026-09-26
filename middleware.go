@@ -38,7 +38,8 @@ type Observation struct {
 
 // ObserveFunc receives one Observation per handled action request. Install one
 // with WithObserver; it is the seam for access logging, latency metrics, and
-// tracing. It must not write to the response.
+// tracing. It runs synchronously once the action's handler chain returns, and
+// it must not write to the response.
 type ObserveFunc func(Observation)
 
 // ctxKey is the private context-key type for the framework's request-scoped
@@ -150,7 +151,8 @@ func (r *Registry) observeMiddleware(actionID, method, path string) Middleware {
 }
 
 // timeoutMiddleware bounds an action's handler with a context deadline. The
-// handler must honor ctx; the typed handler maps a deadline overrun to 504.
+// handler must honor ctx; the typed handler turns an error returned after the
+// deadline into a 504.
 func timeoutMiddleware(d time.Duration) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

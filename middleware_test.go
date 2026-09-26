@@ -39,11 +39,14 @@ func callAPI(t *testing.T, method, url, body string) (int, http.Header, string) 
 // panicAction panics inside its handler, exercising recovery.
 func panicAction() actions.Action[pingReq, pingResp] {
 	return actions.Action[pingReq, pingResp]{
-		ID:       "test.panic",
-		Method:   http.MethodPost,
-		Path:     "/panic",
-		Summary:  "Panic",
-		Statuses: []actions.StatusDoc{{Code: 500, Description: "boom", Error: true}},
+		ID:      "test.panic",
+		Method:  http.MethodPost,
+		Path:    "/panic",
+		Summary: "Panic",
+		Statuses: []actions.StatusDoc{
+			{Code: http.StatusOK, Description: "ok"},
+			{Code: http.StatusInternalServerError, Description: "boom", Error: true},
+		},
 		Handle: func(_ context.Context, _ pingReq) (pingResp, error) {
 			panic("handler exploded")
 		},
@@ -219,6 +222,7 @@ func TestObserver(t *testing.T) {
 	reg := actions.NewRegistry(actions.WithObserver(obs.observe))
 	actions.Register(reg, pingAction())
 	actions.Register(reg, panicAction())
+	actions.Register(reg, boomAction())
 	srv := actiontest.NewServer(t, reg)
 
 	t.Run("a successful request is observed with id, status, and latency", func(t *testing.T) {
@@ -242,6 +246,17 @@ func TestObserver(t *testing.T) {
 		require.True(t, ok, "expected an observation for test.panic")
 		assert.Equal(t, http.StatusInternalServerError, ob.Status)
 		assert.Error(t, ob.Err)
+	})
+
+	t.Run("a handler error is observed unredacted", func(t *testing.T) {
+		status, _, body := callAPI(t, http.MethodPost, srv.URL+"/boom", `{"name":"x"}`)
+		require.Equal(t, http.StatusInternalServerError, status)
+		assert.NotContains(t, body, errBoom.Error(), "the wire message stays redacted")
+
+		ob, ok := obs.find("test.boom")
+		require.True(t, ok, "expected an observation for test.boom")
+		assert.Equal(t, http.StatusInternalServerError, ob.Status)
+		assert.ErrorIs(t, ob.Err, errBoom)
 	})
 }
 
@@ -354,11 +369,14 @@ func TestNotFoundAndMethodNotAllowed(t *testing.T) {
 func TestPanicRecovery_AbortHandlerRepanics(t *testing.T) {
 	t.Parallel()
 	abort := actions.Action[pingReq, pingResp]{
-		ID:       "test.abort",
-		Method:   http.MethodPost,
-		Path:     "/abort",
-		Summary:  "Abort",
-		Statuses: []actions.StatusDoc{{Code: 500, Description: "x", Error: true}},
+		ID:      "test.abort",
+		Method:  http.MethodPost,
+		Path:    "/abort",
+		Summary: "Abort",
+		Statuses: []actions.StatusDoc{
+			{Code: http.StatusOK, Description: "ok"},
+			{Code: http.StatusInternalServerError, Description: "x", Error: true},
+		},
 		Handle: func(_ context.Context, _ pingReq) (pingResp, error) {
 			panic(http.ErrAbortHandler)
 		},

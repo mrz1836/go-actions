@@ -1,64 +1,138 @@
 package actions
 
 import (
+	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 )
 
-// decodeRequest binds an incoming *http.Request into a typed Req value. JSON
-// body fields bind from the request body; fields tagged path/query/header bind
-// from the URL, query string, and headers respectively. A field with no
-// binding tag is ignored. A malformed JSON body yields a 400 (see decodeBody for
-// strict mode); a path/query/header value that cannot be converted yields a 422.
+// requestBinder is the compiled binding plan for one request type: which
+// fields bind from the path, query string, and headers. It is built once per
+// type (see binderFor), so a request pays no struct-tag parsing.
+type requestBinder struct {
+	// isStruct reports that the request type is a struct, or a pointer to one;
+	// any other request type binds nothing.
+	isStruct bool
+	params   []paramBinding
+	// hasQuery reports that some parameter binds from the query string, so the
+	// query is parsed (once) per request.
+	hasQuery bool
+}
+
+// paramBinding is one parameter field plus its pre-computed lookup key.
+type paramBinding struct {
+	paramField
+
+	// headerKey is the canonical header key for an "in: header" parameter.
+	headerKey string
+}
+
+// binderCache holds one compiled *requestBinder per request type.
 //
-//nolint:gocognit,gocyclo // one loop over a struct's binding tags
+//nolint:gochecknoglobals // an immutable per-type compilation cache
+var binderCache sync.Map
+
+// binderFor returns the compiled binder for request type t, building and
+// caching it on first use.
+func binderFor(t reflect.Type) *requestBinder {
+	if b, ok := binderCache.Load(t); ok {
+		return b.(*requestBinder)
+	}
+	b, _ := binderCache.LoadOrStore(t, newRequestBinder(t))
+	return b.(*requestBinder)
+}
+
+// newRequestBinder compiles the binding plan for request type t.
+func newRequestBinder(t reflect.Type) *requestBinder {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	b := &requestBinder{}
+	if t.Kind() != reflect.Struct {
+		return b
+	}
+	b.isStruct = true
+	for _, p := range paramFields(t) {
+		pb := paramBinding{paramField: p}
+		switch p.in {
+		case "query":
+			b.hasQuery = true
+		case "header":
+			pb.headerKey = textproto.CanonicalMIMEHeaderKey(p.name)
+		}
+		b.params = append(b.params, pb)
+	}
+	return b
+}
+
+// decodeRequest binds an incoming *http.Request into a typed Req value, reading
+// the body only when the request method carries one (see methodHasBody). It is
+// the generic form of requestBinder.bind.
 func decodeRequest[Req any](r *http.Request, strict bool) (Req, error) {
 	var req Req
-	rv := reflect.ValueOf(&req).Elem()
-	if rv.Kind() != reflect.Struct {
-		return req, nil
-	}
+	err := binderFor(reflect.TypeFor[Req]()).bind(r, reflect.ValueOf(&req).Elem(), methodHasBody(r.Method), strict)
+	return req, err
+}
 
-	if err := decodeBody(r, &req, strict); err != nil {
-		return req, err
+// bind decodes r into dst, an addressable request value. A struct request (or a
+// pointer to one, which is allocated) takes its JSON fields from the body when
+// withBody is set, then its path/query/header fields from the URL and headers;
+// a parameter overrides a body field of the same Go field. An absent or empty
+// parameter leaves the field untouched. A malformed body yields a 400 (see
+// decodeBody); a parameter that cannot be converted yields a 422.
+func (b *requestBinder) bind(r *http.Request, dst reflect.Value, withBody, strict bool) error {
+	if !b.isStruct {
+		return nil
 	}
-
-	rt := rv.Type()
-	for i := range rt.NumField() {
-		f := rt.Field(i)
-		fv := rv.Field(i)
-		if !fv.CanSet() {
-			continue
+	v := dst
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
 		}
-		switch {
-		case hasTag(f, "path"):
-			if err := setScalar(fv, chi.URLParam(r, f.Tag.Get("path")), tagName(f)); err != nil {
-				return req, err
-			}
-		case hasTag(f, "query"):
-			if v := r.URL.Query().Get(f.Tag.Get("query")); v != "" {
-				if err := setScalar(fv, v, tagName(f)); err != nil {
-					return req, err
-				}
-			}
-		case hasTag(f, "header"):
-			if v := r.Header.Get(f.Tag.Get("header")); v != "" {
-				if err := setScalar(fv, v, tagName(f)); err != nil {
-					return req, err
-				}
-			}
+		v = v.Elem()
+	}
+	if withBody {
+		if err := decodeBody(r, v.Addr().Interface(), strict); err != nil {
+			return err
 		}
 	}
-	return req, nil
+	if len(b.params) == 0 {
+		return nil
+	}
+	var query url.Values
+	if b.hasQuery {
+		query = r.URL.Query()
+	}
+	for i := range b.params {
+		p := &b.params[i]
+		var raw string
+		switch p.in {
+		case "path":
+			raw = chi.URLParam(r, p.name)
+		case "query":
+			raw = query.Get(p.name)
+		default:
+			if vals := r.Header[p.headerKey]; len(vals) > 0 {
+				raw = vals[0]
+			}
+		}
+		if err := setScalar(v.Field(p.index), raw, p.name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // jsonMediaType is the Content-Type prefix whose request bodies are decoded.
@@ -68,13 +142,14 @@ const jsonMediaType = "application/json"
 // decode. Strict mode sends it alone, with no parser detail.
 const malformedBodyMessage = "malformed JSON body"
 
-// decodeBody decodes a JSON request body into req when the request carries one.
-// The JSON media type matches case-insensitively (RFC 9110). In strict mode
-// (WithStrictDecoding) an unknown field, or any data after the first JSON
+// decodeBody decodes a JSON request body into req (a pointer) when the request
+// carries one: an absent or empty body, or a Content-Type other than JSON, is
+// skipped. The JSON media type matches case-insensitively (RFC 9110). In strict
+// mode (WithStrictDecoding) an unknown field, or any data after the first JSON
 // value, is rejected, and every malformed body carries only the generic
 // message.
-func decodeBody[Req any](r *http.Request, req *Req, strict bool) error {
-	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodDelete {
+func decodeBody(r *http.Request, req any, strict bool) error {
+	if r.Body == nil {
 		return nil
 	}
 	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
@@ -145,25 +220,27 @@ func parseTimeValue(raw string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("%w: %q", errInvalidTime, raw)
 }
 
-// hasTag reports whether field f carries a non-empty struct tag named key.
-func hasTag(f reflect.StructField, key string) bool {
-	v, ok := f.Tag.Lookup(key)
-	return ok && v != ""
-}
+// textUnmarshalerType is the reflect.Type of encoding.TextUnmarshaler.
+//
+//nolint:gochecknoglobals // a cached reflect.Type is an intentional package global
+var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
-// tagName returns the field's JSON name for error reporting, falling back to
-// the Go field name.
-func tagName(f reflect.StructField) string {
-	if j := f.Tag.Get("json"); j != "" && j != "-" {
-		return jsonFirstSegment(j)
+// paramError is the 422 for a parameter value that cannot be converted.
+func paramError(name, message string) error {
+	return &APIError{
+		Status: http.StatusUnprocessableEntity, Code: CodeValidation,
+		Message: "validation failed", Fields: []FieldError{{Field: name, Message: message}},
 	}
-	return f.Name
 }
 
-// setScalar converts the string raw into the scalar field fv. It transparently
-// allocates and follows a pointer field — so optional query/header parameters
-// can be typed as *bool, *int, *time.Time, etc. — and binds an RFC3339 (or
-// bare calendar date) string into a time.Time field.
+// setScalar converts the string raw into the parameter field fv, reporting a
+// failure under name. An empty raw leaves the field untouched. It allocates and
+// follows a pointer field — so an optional parameter can be typed as *bool,
+// *int, *time.Time, and so on — binds an RFC3339 (or bare calendar date) string
+// into a time.Time, defers to encoding.TextUnmarshaler (so uuid.UUID binds),
+// and otherwise converts by kind: string, bool, and the integer and float kinds.
+//
+//nolint:gocyclo // one switch over the bindable kinds
 func setScalar(fv reflect.Value, raw, name string) error {
 	if raw == "" {
 		return nil
@@ -177,12 +254,16 @@ func setScalar(fv reflect.Value, raw, name string) error {
 	if fv.Type() == timeType {
 		t, err := parseTimeValue(raw)
 		if err != nil {
-			return &APIError{
-				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
-				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be an RFC3339 timestamp"}},
-			}
+			return paramError(name, "must be an RFC3339 timestamp")
 		}
 		fv.Set(reflect.ValueOf(t))
+		return nil
+	}
+	if reflect.PointerTo(fv.Type()).Implements(textUnmarshalerType) {
+		u := fv.Addr().Interface().(encoding.TextUnmarshaler)
+		if err := u.UnmarshalText([]byte(raw)); err != nil {
+			return paramError(name, textErrorMessage(fv.Type()))
+		}
 		return nil
 	}
 	switch fv.Kind() { //nolint:exhaustive // unhandled kinds fall through to the default
@@ -191,37 +272,25 @@ func setScalar(fv reflect.Value, raw, name string) error {
 	case reflect.Bool:
 		b, err := strconv.ParseBool(raw)
 		if err != nil {
-			return &APIError{
-				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
-				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be a boolean"}},
-			}
+			return paramError(name, "must be a boolean")
 		}
 		fv.SetBool(b)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		n, err := strconv.ParseInt(raw, 10, 64)
+		n, err := strconv.ParseInt(raw, 10, fv.Type().Bits())
 		if err != nil {
-			return &APIError{
-				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
-				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be an integer"}},
-			}
+			return paramError(name, "must be an integer")
 		}
 		fv.SetInt(n)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		n, err := strconv.ParseUint(raw, 10, 64)
+		n, err := strconv.ParseUint(raw, 10, fv.Type().Bits())
 		if err != nil {
-			return &APIError{
-				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
-				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be a non-negative integer"}},
-			}
+			return paramError(name, "must be a non-negative integer")
 		}
 		fv.SetUint(n)
 	case reflect.Float32, reflect.Float64:
-		n, err := strconv.ParseFloat(raw, 64)
+		n, err := strconv.ParseFloat(raw, fv.Type().Bits())
 		if err != nil {
-			return &APIError{
-				Status: http.StatusUnprocessableEntity, Code: CodeValidation,
-				Message: "validation failed", Fields: []FieldError{{Field: name, Message: "must be a number"}},
-			}
+			return paramError(name, "must be a number")
 		}
 		fv.SetFloat(n)
 	default:
@@ -235,4 +304,13 @@ func setScalar(fv reflect.Value, raw, name string) error {
 		}
 	}
 	return nil
+}
+
+// textErrorMessage is the 422 detail for a TextUnmarshaler parameter that
+// rejected its value.
+func textErrorMessage(t reflect.Type) string {
+	if t == uuidType {
+		return "must be a valid UUID"
+	}
+	return "has an invalid format"
 }

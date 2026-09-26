@@ -5,8 +5,8 @@ import (
 	"net/http"
 )
 
-// responseEnvelope is implemented by the Empty, Created[T], and Accepted[T]
-// response wrappers. It lets the encoder pick the HTTP status and body without
+// responseEnvelope is implemented by the Empty, Created[T], Accepted[T], and
+// Response[T] response wrappers. It lets the encoder pick the HTTP status and body without
 // reflecting on the concrete type.
 type responseEnvelope interface {
 	envelopeStatus() int
@@ -81,12 +81,20 @@ func encodeResponse(w http.ResponseWriter, resp any) {
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	b, err := json.Marshal(data)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header()["Content-Type"] = jsonContentType
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":"failed to encode response","code":"` + CodeInternal + `"}`))
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header()["Content-Type"] = jsonContentType
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
 }
+
+// jsonContentType is the shared Content-Type header value of every JSON
+// response. Assigning it directly skips the per-response slice allocation of
+// Header.Set; Set and Add on the header replace or copy it rather than
+// mutating it.
+//
+//nolint:gochecknoglobals // an immutable, shared header value
+var jsonContentType = []string{"application/json"}

@@ -7,11 +7,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func withURLParam(r *http.Request, key, val string) *http.Request {
@@ -492,6 +498,207 @@ func BenchmarkDecodeRequest(b *testing.B) {
 		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 			"/leads", bytes.NewReader(body))
 		r.Header.Set("Content-Type", "application/json")
+		if _, err := decodeRequest[req](r, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// requireParamError asserts err is a 422 naming exactly one field.
+func requireParamError(t *testing.T, err error, field, message string) {
+	t.Helper()
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusUnprocessableEntity, apiErr.Status)
+	assert.Equal(t, CodeValidation, apiErr.Code)
+	assert.Equal(t, []FieldError{{Field: field, Message: message}}, apiErr.Fields)
+}
+
+func TestDecodeTextUnmarshalerParams(t *testing.T) {
+	type req struct {
+		ID   uuid.UUID   `json:"-" path:"id"`
+		Ref  *uuid.UUID  `json:"-" query:"ref"`
+		Addr *netip.Addr `json:"-" header:"X-Client-IP"`
+	}
+	const id = "01900000-0000-7000-8000-000000000001"
+
+	t.Run("valid values bind", func(t *testing.T) {
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?ref="+id, nil)
+		r.Header.Set("X-Client-IP", "10.0.0.1")
+		got, err := decodeRequest[req](withURLParam(r, "id", id), false)
+		require.NoError(t, err)
+		assert.Equal(t, uuid.MustParse(id), got.ID)
+		require.NotNil(t, got.Ref)
+		assert.Equal(t, uuid.MustParse(id), *got.Ref)
+		require.NotNil(t, got.Addr)
+		assert.Equal(t, netip.MustParseAddr("10.0.0.1"), *got.Addr)
+	})
+
+	t.Run("an invalid uuid is a 422 under the parameter name", func(t *testing.T) {
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+		_, err := decodeRequest[req](withURLParam(r, "id", "nope"), false)
+		requireParamError(t, err, "id", "must be a valid UUID")
+	})
+
+	t.Run("another TextUnmarshaler's failure is a 422", func(t *testing.T) {
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+		r.Header.Set("X-Client-IP", "not-an-ip")
+		_, err := decodeRequest[req](withURLParam(r, "id", id), false)
+		requireParamError(t, err, "X-Client-IP", "has an invalid format")
+	})
+}
+
+func TestDecodeParamErrorsUseParamNames(t *testing.T) {
+	type req struct {
+		Limit  int     `json:"-" query:"limit"`
+		Small  int8    `json:"-" query:"small"`
+		Count  uint16  `json:"-" header:"X-Count"`
+		Ratio  float32 `json:"-" header:"X-Ratio"`
+		Named  string  `json:"named_json" query:"named_param"`
+		Active bool    `json:"-" header:"X-Active"`
+	}
+	tests := []struct {
+		name    string
+		target  string
+		headers map[string]string
+		field   string
+		message string
+	}{
+		{"json-dash query field", "/x?limit=abc", nil, "limit", "must be an integer"},
+		{"integer overflow", "/x?small=300", nil, "small", "must be an integer"},
+		{"header uint", "/x", map[string]string{"X-Count": "-1"}, "X-Count", "must be a non-negative integer"},
+		{"header float", "/x", map[string]string{"X-Ratio": "1e40"}, "X-Ratio", "must be a number"},
+		{"header bool", "/x", map[string]string{"X-Active": "maybe"}, "X-Active", "must be a boolean"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.target, nil)
+			for k, v := range tc.headers {
+				r.Header.Set(k, v)
+			}
+			_, err := decodeRequest[req](r, false)
+			requireParamError(t, err, tc.field, tc.message)
+		})
+	}
+}
+
+func TestDecodeBindingRules(t *testing.T) {
+	t.Run("GET and DELETE bodies are never decoded", func(t *testing.T) {
+		type req struct {
+			Name string `json:"name"`
+		}
+		for _, method := range []string{http.MethodGet, http.MethodDelete} {
+			r := httptest.NewRequestWithContext(t.Context(), method, "/x", strings.NewReader(`{"name":"ignored"`))
+			r.Header.Set("Content-Type", "application/json")
+			got, err := decodeRequest[req](r, true)
+			require.NoError(t, err, method)
+			assert.Empty(t, got.Name, method)
+		}
+	})
+
+	t.Run("a repeated query parameter binds its first value", func(t *testing.T) {
+		type req struct {
+			Tag string `json:"-" query:"tag"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?tag=a&tag=b", nil)
+		got, err := decodeRequest[req](r, false)
+		require.NoError(t, err)
+		assert.Equal(t, "a", got.Tag)
+	})
+
+	t.Run("an empty parameter is treated as absent", func(t *testing.T) {
+		type req struct {
+			Limit *int `json:"-" query:"limit"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?limit=", nil)
+		got, err := decodeRequest[req](r, false)
+		require.NoError(t, err)
+		assert.Nil(t, got.Limit)
+	})
+
+	t.Run("a parameter overrides the body field it shares", func(t *testing.T) {
+		type req struct {
+			ID string `json:"id" path:"pid"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/x/p", strings.NewReader(`{"id":"b"}`))
+		got, err := decodeRequest[req](withURLParam(r, "pid", "p"), false)
+		require.NoError(t, err)
+		assert.Equal(t, "p", got.ID)
+	})
+
+	t.Run("unexported and embedded parameter fields are not bound", func(t *testing.T) {
+		type embedded struct {
+			Inner string `json:"-" query:"inner"`
+		}
+		type req struct {
+			embedded
+
+			hidden string `query:"hidden"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?inner=a&hidden=b", nil)
+		got, err := decodeRequest[req](r, false)
+		require.NoError(t, err)
+		assert.Empty(t, got.Inner)
+		assert.Empty(t, got.hidden)
+	})
+
+	t.Run("a pointer request type is allocated and bound", func(t *testing.T) {
+		type req struct {
+			Name  string `json:"name"`
+			Limit int    `json:"-" query:"limit"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x?limit=3", strings.NewReader(`{"name":"a"}`))
+		got, err := decodeRequest[*req](r, false)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, req{Name: "a", Limit: 3}, *got)
+	})
+
+	t.Run("a JSON null body leaves a pointer request allocated", func(t *testing.T) {
+		type req struct {
+			Name string `json:"name"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(`null`))
+		got, err := decodeRequest[*req](r, false)
+		require.NoError(t, err)
+		assert.NotNil(t, got)
+	})
+
+	t.Run("a request without a Body decodes as empty", func(t *testing.T) {
+		type req struct {
+			Name string `json:"name" validate:"required"`
+		}
+		r := &http.Request{Method: http.MethodPost, URL: &url.URL{Path: "/x"}, Header: http.Header{}}
+		got, err := decodeRequest[req](r, true)
+		require.NoError(t, err)
+		assert.Empty(t, got.Name)
+	})
+
+	t.Run("binders are cached per type", func(t *testing.T) {
+		type req struct {
+			A string `json:"-" query:"a"`
+		}
+		first, second := binderFor(reflect.TypeFor[req]()), binderFor(reflect.TypeFor[req]())
+		assert.Same(t, first, second)
+	})
+}
+
+// BenchmarkDecodeRequest_Params measures binding path, query, and header
+// parameters — the query string is parsed once however many fields read it.
+func BenchmarkDecodeRequest_Params(b *testing.B) {
+	type req struct {
+		ID     string `json:"-" path:"id"`
+		Cursor string `json:"-" query:"cursor"`
+		Limit  int    `json:"-" query:"limit"`
+		Active *bool  `json:"-" query:"active"`
+		Trace  string `json:"-" header:"X-Trace-Id"`
+	}
+	base := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/pets/p_1?cursor=c_9&limit=25&active=true", nil)
+	base.Header.Set("X-Trace-Id", "t-1")
+	r := withURLParam(base, "id", "p_1")
+	b.ReportAllocs()
+	for b.Loop() {
 		if _, err := decodeRequest[req](r, false); err != nil {
 			b.Fatal(err)
 		}
