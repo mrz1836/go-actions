@@ -341,6 +341,25 @@ return actions.APIError{
 }
 ```
 
+To put a response header in the contract, list it on the status with `HeaderDoc`. Each one
+becomes an entry in that response's OpenAPI `headers` object. An empty `Type` means
+`string`, and a `HeaderDoc` without a `Name` panics at `Freeze`:
+
+```go
+Statuses: []actions.StatusDoc{
+	{Code: http.StatusOK, Description: "the item"},
+	{
+		Code: http.StatusTooManyRequests, Description: "rate limited", Error: true,
+		Headers: []actions.HeaderDoc{{
+			Name:        "Retry-After",
+			Description: "Seconds to wait before retrying.",
+			Type:        "integer",
+			Required:    true,
+		}},
+	},
+},
+```
+
 The contract documents the envelope as the `Error` component: `error` and `code` are
 required, and `request_id` is optional (it is omitted when empty). To give generated
 clients a closed set of codes, list the ones your mapper and middleware emit:
