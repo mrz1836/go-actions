@@ -81,9 +81,11 @@ func WithStripPrefix(prefix string) Option {
 
 // WithMiddleware appends registry-wide middleware applied to every route — the
 // actions, the self-documentation endpoints, and the 404/405 responses. The
-// first middleware is outermost. It composes with chi and any net/http
-// middleware. Caller middleware runs outside the framework's request-id and
-// panic-recovery layers.
+// first middleware is outermost; repeated calls append. It composes with chi and
+// any net/http middleware. Caller middleware runs outside the framework's
+// request-id and panic-recovery layers: RequestIDFromContext is empty there, a
+// panic in it is not recovered, and a request it rejects never reaches the
+// observer.
 func WithMiddleware(mw ...Middleware) Option {
 	return func(r *Registry) {
 		r.middleware = append(r.middleware, mw...)
@@ -113,8 +115,9 @@ func WithStrictDecoding() Option {
 
 // WithObserver installs a per-request observability hook invoked after each
 // action completes with its id, status, latency, and error (panics included).
-// It is the seam for access logging, metrics, and tracing. A nil hook is
-// ignored.
+// It is the seam for access logging, metrics, and tracing. It sees only
+// requests routed to an action — not the self-documentation endpoints, 404/405
+// responses, or requests rejected by WithMiddleware. A nil hook is ignored.
 func WithObserver(fn ObserveFunc) Option {
 	return func(r *Registry) {
 		if fn != nil {
@@ -155,7 +158,7 @@ func WithMethodNotAllowedHandler(h http.Handler) Option {
 }
 
 // WithServers sets the OpenAPI servers[] block so generated clients know the
-// base URLs the contract is served at.
+// base URLs the contract is served at. Repeated calls append.
 func WithServers(servers ...Server) Option {
 	return func(r *Registry) {
 		r.servers = append(r.servers, servers...)
@@ -164,6 +167,7 @@ func WithServers(servers ...Server) Option {
 
 // WithSecurityScheme registers a named OpenAPI security scheme under
 // components.securitySchemes. Reference it from WithSecurity or Action.Security.
+// Registering the same name again replaces the scheme.
 func WithSecurityScheme(name string, scheme SecurityScheme) Option {
 	return func(r *Registry) {
 		if r.securitySchemes == nil {
@@ -174,7 +178,8 @@ func WithSecurityScheme(name string, scheme SecurityScheme) Option {
 }
 
 // WithSecurity sets the registry-wide default security requirements applied to
-// every operation that does not declare its own Action.Security.
+// every operation that does not declare its own Action.Security. Repeated calls
+// append.
 func WithSecurity(reqs ...SecurityRequirement) Option {
 	return func(r *Registry) {
 		r.security = append(r.security, reqs...)
@@ -182,9 +187,11 @@ func WithSecurity(reqs ...SecurityRequirement) Option {
 }
 
 // WithOpenAPIVersion selects the declared OpenAPI dialect: "3.1.0" (default) or
-// "3.0.3". The generated schema fragments are a common subset valid under both;
-// only the declared version string changes. An unsupported value panics at
-// construction.
+// "3.0.3". Besides the declared version string, the dialect decides two schema
+// forms: a nullable field is a "null" type (3.1) or "nullable": true (3.0), and
+// a []byte is a string with "contentEncoding": "base64" (3.1) or "format":
+// "byte" (3.0). Any other value panics when the option is applied (at
+// NewRegistry).
 func WithOpenAPIVersion(v string) Option {
 	return func(r *Registry) {
 		switch v {

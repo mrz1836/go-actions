@@ -19,16 +19,17 @@ func (r *Registry) buildArtifacts() {
 	r.buildIndex()
 }
 
-// buildOpenAPI assembles the OpenAPI 3.1 document, marshals it once to JSON, and
-// derives the YAML serialization from the same structure. The info block is
-// taken from the registry's configured (or default) OpenAPI info.
+// buildOpenAPI assembles the OpenAPI document in the declared dialect, marshals
+// it once to JSON, and derives the YAML serialization from the same structure.
+// The info block is taken from the registry's configured (or default) OpenAPI
+// info.
 func (r *Registry) buildOpenAPI() {
 	version := r.openapiVersion
 	if version == "" {
 		version = defaultOpenAPIVersion
 	}
 	sb := newSchemaBuilder()
-	sb.nullableKeyword = strings.HasPrefix(version, "3.0.")
+	sb.openAPI30 = strings.HasPrefix(version, "3.0.")
 	paths := map[string]any{}
 	for _, a := range r.actions {
 		pathItem, ok := paths[a.path].(map[string]any)
@@ -39,7 +40,7 @@ func (r *Registry) buildOpenAPI() {
 		paths[a.path] = pathItem
 	}
 	schemas := sb.components()
-	schemas["Error"] = errorSchema(r.errorCodeEnum())
+	schemas[errorComponent] = errorSchema(r.errorCodeEnum())
 
 	components := map[string]any{"schemas": schemas}
 	if len(r.securitySchemes) > 0 {
@@ -117,13 +118,15 @@ func buildOperation(sb *schemaBuilder, a anyAction) map[string]any {
 	if params := buildParameters(sb, a.reqType); len(params) > 0 {
 		op["parameters"] = params
 	}
-	if body := buildRequestBody(sb, a.reqType); body != nil {
+	if body := buildRequestBody(sb, a.method, a.reqType); body != nil {
 		op["requestBody"] = body
 	}
 	return op
 }
 
-// buildParameters builds the path/query/header parameter objects of a request.
+// buildParameters builds the path/query/header parameter objects of a request
+// from the same fields the decoder binds (see paramFields). A path parameter is
+// always required; others are required by validate:"required".
 func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 	for reqType.Kind() == reflect.Pointer {
 		reqType = reqType.Elem()
@@ -132,37 +135,29 @@ func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 		return nil
 	}
 	var params []any
-	for i := range reqType.NumField() {
-		f := reqType.Field(i)
-		in, name := parameterLocation(f)
-		if in == "" {
-			continue
-		}
-		schema := sb.schemaFor(f.Type, modeRequest)
-		applyConstraints(schema, f.Tag.Get("validate"))
+	for _, p := range paramFields(reqType) {
+		rules := parseRules(p.field.Tag.Get("validate"), p.field.Type)
+		schema := sb.schemaFor(p.field.Type, modeRequest)
+		applyConstraints(schema, rules)
 		params = append(params, map[string]any{
-			"name":     name,
-			"in":       in,
-			"required": in == "path" || hasRule(f.Tag.Get("validate"), "required"),
+			"name":     p.name,
+			"in":       p.in,
+			"required": p.in == "path" || hasRequiredRule(rules),
 			"schema":   schema,
 		})
 	}
 	return params
 }
 
-// parameterLocation reports a field's OpenAPI parameter location and name.
-func parameterLocation(f reflect.StructField) (in, name string) {
-	for _, key := range []string{"path", "query", "header"} {
-		if v, ok := f.Tag.Lookup(key); ok && v != "" {
-			return key, v
-		}
+// buildRequestBody builds the requestBody object, or nil when the method's body
+// is never decoded (see methodHasBody) or the request has no JSON body fields.
+// The body is required exactly when its schema requires a property: an absent
+// body decodes as the zero value, which then fails validation only if some
+// field is required.
+func buildRequestBody(sb *schemaBuilder, method string, reqType reflect.Type) map[string]any {
+	if !methodHasBody(method) {
+		return nil
 	}
-	return "", ""
-}
-
-// buildRequestBody builds the requestBody object, or nil when the request has
-// no JSON body fields.
-func buildRequestBody(sb *schemaBuilder, reqType reflect.Type) map[string]any {
 	for reqType.Kind() == reflect.Pointer {
 		reqType = reqType.Elem()
 	}
@@ -174,10 +169,11 @@ func buildRequestBody(sb *schemaBuilder, reqType reflect.Type) map[string]any {
 	if len(props) == 0 {
 		return nil
 	}
-	return map[string]any{
-		"required": true,
-		"content":  jsonContent(schema),
+	body := map[string]any{"content": jsonContent(schema)}
+	if _, required := schema["required"]; required {
+		body["required"] = true
 	}
+	return body
 }
 
 // buildResponses builds the responses object from an action's StatusDocs.
@@ -211,7 +207,7 @@ func responseHeaders(docs []HeaderDoc) map[string]any {
 	for _, h := range docs {
 		typ := h.Type
 		if typ == "" {
-			typ = "string"
+			typ = typeString
 		}
 		header := map[string]any{
 			"description": h.Description,
@@ -247,16 +243,16 @@ func (r *Registry) errorCodeEnum() []string {
 // The encoder always writes error and code, so both are required; request_id is
 // omitted when empty. A non-nil codes list becomes the enum of code.
 func errorSchema(codes []string) map[string]any {
-	code := map[string]any{schemaTypeKey: "string"}
+	code := map[string]any{schemaTypeKey: typeString}
 	if codes != nil {
 		code["enum"] = codes
 	}
 	return map[string]any{
 		schemaTypeKey: "object",
 		"properties": map[string]any{
-			"error":      map[string]any{schemaTypeKey: "string"},
+			"error":      map[string]any{schemaTypeKey: typeString},
 			"code":       code,
-			"request_id": map[string]any{schemaTypeKey: "string"},
+			"request_id": map[string]any{schemaTypeKey: typeString},
 		},
 		"required": []string{"error", "code"},
 	}

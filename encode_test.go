@@ -2,9 +2,12 @@ package actions
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // BenchmarkEncodeResponse covers the three envelope shapes plus a plain
@@ -102,5 +105,22 @@ func TestEncodeResponse(t *testing.T) {
 		if !strings.Contains(w.Body.String(), CodeInternal) {
 			t.Fatalf("body = %q, want code %s", w.Body.String(), CodeInternal)
 		}
+	})
+}
+
+func TestEnvelopeDefaults(t *testing.T) {
+	t.Run("Empty has no body", func(t *testing.T) {
+		assert.Nil(t, Empty{}.envelopeBody())
+	})
+
+	t.Run("a zero-status Response is a 200 with its headers", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		encodeResponse(w, Response[map[string]int]{
+			Header: http.Header{"Etag": {`"v1"`}},
+			Body:   map[string]int{"n": 1},
+		})
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, `"v1"`, w.Header().Get("ETag"))
+		assert.JSONEq(t, `{"n":1}`, w.Body.String())
 	})
 }

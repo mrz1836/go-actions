@@ -8,6 +8,10 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // stringType is the JSON Schema "string" type keyword, named here so the test
@@ -73,11 +77,12 @@ func TestSchemaFor(t *testing.T) {
 		}
 	})
 
-	t.Run("byte slice is arbitrary JSON", func(t *testing.T) {
+	t.Run("byte slice is a base64 string", func(t *testing.T) {
 		t.Parallel()
 		b := newSchemaBuilder()
-		if got := b.schemaFor(reflect.TypeOf([]byte{}), modeRequest); len(got) != 0 {
-			t.Fatalf("[]byte schema = %v, want empty", got)
+		got := b.schemaFor(reflect.TypeOf([]byte{}), modeRequest)
+		if got["type"] != stringType || got["contentEncoding"] != "base64" {
+			t.Fatalf("[]byte schema = %v, want a base64 string", got)
 		}
 	})
 
@@ -152,7 +157,7 @@ func TestSchemaFor(t *testing.T) {
 			t.Fatalf("phone schema = %v, want e164 pattern", phone)
 		}
 		kind, _ := props["kind"].(map[string]any)
-		enum, _ := kind["enum"].([]string)
+		enum, _ := kind["enum"].([]any)
 		if len(enum) != 2 {
 			t.Fatalf("kind enum = %v, want [a b]", enum)
 		}
@@ -212,7 +217,7 @@ func TestBuildRequestBody(t *testing.T) {
 	t.Run("non-struct request type has no body", func(t *testing.T) {
 		t.Parallel()
 		b := newSchemaBuilder()
-		if got := buildRequestBody(b, reflect.TypeOf("")); got != nil {
+		if got := buildRequestBody(b, http.MethodPost, reflect.TypeOf("")); got != nil {
 			t.Fatalf("buildRequestBody(string) = %v, want nil", got)
 		}
 	})
@@ -224,20 +229,35 @@ func TestBuildRequestBody(t *testing.T) {
 			Limit int    `json:"-" query:"limit"`
 		}
 		b := newSchemaBuilder()
-		if got := buildRequestBody(b, reflect.TypeFor[req]()); got != nil {
+		if got := buildRequestBody(b, http.MethodPost, reflect.TypeFor[req]()); got != nil {
 			t.Fatalf("buildRequestBody(no-body req) = %v, want nil", got)
 		}
 	})
 
-	t.Run("request with JSON fields produces a required body", func(t *testing.T) {
+	t.Run("request with a required JSON field produces a required body", func(t *testing.T) {
+		t.Parallel()
+		type req struct {
+			Name string `json:"name" validate:"required"`
+		}
+		b := newSchemaBuilder()
+		got := buildRequestBody(b, http.MethodPost, reflect.TypeFor[req]())
+		if got == nil || got["required"] != true {
+			t.Fatalf("buildRequestBody(body req) = %v, want a required body", got)
+		}
+	})
+
+	t.Run("request with only optional JSON fields produces an optional body", func(t *testing.T) {
 		t.Parallel()
 		type req struct {
 			Name string `json:"name"`
 		}
 		b := newSchemaBuilder()
-		got := buildRequestBody(b, reflect.TypeFor[req]())
-		if got == nil || got["required"] != true {
-			t.Fatalf("buildRequestBody(body req) = %v, want a required body", got)
+		got := buildRequestBody(b, http.MethodPost, reflect.TypeFor[req]())
+		if got == nil {
+			t.Fatal("buildRequestBody(body req) = nil, want a body")
+		}
+		if _, ok := got["required"]; ok {
+			t.Fatalf("buildRequestBody(body req) = %v, want no required flag", got)
 		}
 	})
 }
@@ -330,16 +350,21 @@ type clashReq struct {
 }
 
 // contractFor registers one POST action with request type Req and response type
-// Resp, freezes the registry, and returns the decoded OpenAPI document.
+// Resp, documenting Resp's success status, freezes the registry, and returns the
+// decoded OpenAPI document.
 func contractFor[Req, Resp any](t *testing.T, opts ...Option) map[string]any {
 	t.Helper()
+	status, fixed := successStatus(reflect.TypeFor[Resp]())
+	if !fixed {
+		status = http.StatusOK
+	}
 	reg := NewRegistry(opts...)
 	Register(reg, Action[Req, Resp]{
 		ID:       "test.schema",
 		Method:   http.MethodPost,
 		Path:     "/schema",
 		Summary:  "Schema fixture",
-		Statuses: []StatusDoc{{Code: http.StatusOK, Description: "ok"}},
+		Statuses: []StatusDoc{{Code: status, Description: "ok"}},
 		Handle: func(context.Context, Req) (Resp, error) {
 			var zero Resp
 			return zero, nil
@@ -622,4 +647,257 @@ func TestSchemaRefNames(t *testing.T) {
 	if !slices.Equal(got, []string{"Alpha", "Beta"}) {
 		t.Fatalf("refNames = %v, want [Alpha Beta]", got)
 	}
+}
+
+// propsJSON renders each property schema of an object schema as JSON.
+func propsJSON(t *testing.T, schema map[string]any) map[string]string {
+	t.Helper()
+	props, ok := schema["properties"].(map[string]any)
+	require.True(t, ok, "schema has properties: %v", schema)
+	out := make(map[string]string, len(props))
+	for name, prop := range props {
+		out[name] = jsonOf(t, prop)
+	}
+	return out
+}
+
+func TestSchemaTypedEnumAndStringFormats(t *testing.T) {
+	type req struct {
+		Level int       `json:"level" validate:"oneof=1 2 3"`
+		Ratio float64   `json:"ratio" validate:"oneof=0.5 1"`
+		Kind  string    `json:"kind" validate:"oneof=a b"`
+		Bad   int       `json:"bad" validate:"oneof=1 two"`
+		Code  int       `json:"code" validate:"uuid,email"`
+		When  time.Time `json:"when" validate:"rfc3339"`
+		Phone string    `json:"phone" validate:"e164"`
+	}
+	got := propsJSON(t, newSchemaBuilder().structSchema(reflect.TypeFor[req](), modeRequest))
+	assert.JSONEq(t, `{"type":"integer","enum":[1,2,3]}`, got["level"])
+	assert.JSONEq(t, `{"type":"number","enum":[0.5,1]}`, got["ratio"])
+	assert.JSONEq(t, `{"type":"string","enum":["a","b"]}`, got["kind"])
+	assert.JSONEq(t, `{"type":"integer"}`, got["bad"], "a malformed oneof is not documented")
+	assert.JSONEq(t, `{"type":"integer"}`, got["code"], "format rules document only strings")
+	assert.JSONEq(t, `{"type":"string","format":"date-time"}`, got["when"])
+	assert.JSONEq(t, `{"type":"string","pattern":"^\\+[1-9]\\d{1,14}$"}`, got["phone"])
+
+	t.Run("a nullable integer enum admits null", func(t *testing.T) {
+		type Resp struct {
+			Level *int `json:"level" validate:"oneof=1 2"`
+		}
+		view := component(t, contractFor[struct{}, Resp](t), "Resp")
+		assert.JSONEq(t, `{"type":["integer","null"],"enum":[1,2,null]}`, jsonOf(t, propertyOf(t, view, "level")))
+	})
+}
+
+// Fixtures for embedded-struct schemas (A4).
+type (
+	EmbPtrPart struct {
+		Maybe string  `json:"maybe"`
+		Nick  *string `json:"nick"`
+	}
+	embValPart struct {
+		Always string `json:"always"`
+		Opt    string `json:"opt,omitempty"`
+	}
+	EmbResp struct {
+		*EmbPtrPart
+		embValPart
+
+		Own string `json:"own"`
+	}
+	embReq struct {
+		embValPart
+
+		Name string `json:"name" validate:"required"`
+	}
+)
+
+func TestSchemaEmbeddedFields(t *testing.T) {
+	doc := contractFor[embReq, EmbResp](t)
+
+	t.Run("response flattens embedded fields; pointer-embedded ones are optional", func(t *testing.T) {
+		view := component(t, doc, "EmbResp")
+		assert.ElementsMatch(t, []string{"maybe", "nick", "always", "opt", "own"}, keysOf(view["properties"].(map[string]any)))
+		assert.Equal(t, []string{"always", "own"}, requiredOf(view))
+		assert.JSONEq(t, `{"type":["string","null"]}`, jsonOf(t, propertyOf(t, view, "nick")),
+			"a pointer field is still nullable when its embed is present")
+	})
+
+	t.Run("request flattens an unexported embedded struct", func(t *testing.T) {
+		body := requestBodyOf(t, doc)
+		assert.ElementsMatch(t, []string{"always", "opt", "name"}, keysOf(body["properties"].(map[string]any)))
+		assert.Equal(t, []string{"name"}, requiredOf(body))
+	})
+}
+
+// Widget shares its name with a function-local type in TestSchemaComponentCollisions.
+type Widget struct {
+	A string `json:"a"`
+}
+
+func TestSchemaComponentCollisions(t *testing.T) {
+	t.Run("two distinct types with one name panic", func(t *testing.T) {
+		type Widget struct {
+			B string `json:"b"`
+		}
+		type Both struct {
+			First  actionsWidget `json:"first"`
+			Second Widget        `json:"second"`
+		}
+		assert.PanicsWithValue(t,
+			`actions: types github.com/mrz1836/go-actions.Widget and github.com/mrz1836/go-actions.Widget both map to the component schema "Widget"; rename one`,
+			func() { contractFor[struct{}, Both](t) })
+	})
+
+	t.Run("a type named Error panics", func(t *testing.T) {
+		type Error struct {
+			Reason string `json:"reason"`
+		}
+		assert.PanicsWithValue(t,
+			`actions: type github.com/mrz1836/go-actions.Error would replace the framework's Error component schema; rename it`,
+			func() { contractFor[struct{}, Error](t) })
+	})
+
+	t.Run("one type in both modes is not a collision", func(t *testing.T) {
+		assert.NotPanics(t, func() { contractFor[SharedSame, SharedSame](t) })
+	})
+}
+
+// actionsWidget aliases the package-level Widget so a test can name both.
+type actionsWidget = Widget
+
+func TestSchemaCollectionBounds(t *testing.T) {
+	type req struct {
+		Tags  []string          `json:"tags" validate:"min=1,max=5"`
+		Attrs map[string]string `json:"attrs" validate:"min=1,max=9"`
+		Pair  [2]int            `json:"pair" validate:"min=1"`
+		Blob  []byte            `json:"blob" validate:"min=1,max=64"`
+		ID    uuid.UUID         `json:"id" validate:"min=1"`
+	}
+	got := propsJSON(t, newSchemaBuilder().structSchema(reflect.TypeFor[req](), modeRequest))
+	assert.JSONEq(t, `{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}`, got["tags"])
+	assert.JSONEq(t, `{"type":"object","additionalProperties":{"type":"string"},"minProperties":1,"maxProperties":9}`, got["attrs"])
+	assert.JSONEq(t, `{"type":"array","items":{"type":"integer"},"minItems":1}`, got["pair"])
+	assert.JSONEq(t, `{"type":"string","contentEncoding":"base64"}`, got["blob"], "a byte count has no schema keyword")
+	assert.JSONEq(t, `{"type":"string","format":"uuid"}`, got["id"])
+}
+
+// Fixtures for the encoding/json precedence of schemaFor (A7).
+type (
+	textStruct struct{}
+	jsonPtr    struct{ V int }
+	blob       []byte
+	textByte   byte
+)
+
+func (textStruct) MarshalText() ([]byte, error) { return []byte("t"), nil }
+func (*jsonPtr) MarshalJSON() ([]byte, error)   { return []byte(`1`), nil }
+func (textByte) MarshalText() ([]byte, error)   { return []byte("b"), nil }
+
+func TestSchemaEncodingPrecedence(t *testing.T) {
+	tests := []struct {
+		name   string
+		typ    reflect.Type
+		want31 string
+		want30 string
+	}{
+		{"[]byte", reflect.TypeFor[[]byte](), `{"type":"string","contentEncoding":"base64"}`, `{"type":"string","format":"byte"}`},
+		{"named []byte", reflect.TypeFor[blob](), `{"type":"string","contentEncoding":"base64"}`, `{"type":"string","format":"byte"}`},
+		{"json.RawMessage", reflect.TypeFor[json.RawMessage](), `{}`, `{}`},
+		{"pointer-receiver MarshalJSON", reflect.TypeFor[jsonPtr](), `{}`, `{}`},
+		{"MarshalText struct", reflect.TypeFor[textStruct](), `{"type":"string"}`, `{"type":"string"}`},
+		{"uuid.UUID", reflect.TypeFor[uuid.UUID](), `{"type":"string","format":"uuid"}`, `{"type":"string","format":"uuid"}`},
+		{"[16]byte", reflect.TypeFor[[16]byte](), `{"type":"array","items":{"type":"integer"}}`, `{"type":"array","items":{"type":"integer"}}`},
+		{"bytes with MarshalText", reflect.TypeFor[[]textByte](), `{"type":"array","items":{"type":"string"}}`, `{"type":"array","items":{"type":"string"}}`},
+		{"time.Time", reflect.TypeFor[*time.Time](), `{"type":"string","format":"date-time"}`, `{"type":"string","format":"date-time"}`},
+		{"time.Duration", reflect.TypeFor[time.Duration](), `{"type":"integer"}`, `{"type":"integer"}`},
+		{"func", reflect.TypeFor[func()](), `{}`, `{}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newSchemaBuilder()
+			assert.JSONEq(t, tc.want31, jsonOf(t, b.schemaFor(tc.typ, modeRequest)), "3.1")
+			b.openAPI30 = true
+			assert.JSONEq(t, tc.want30, jsonOf(t, b.schemaFor(tc.typ, modeRequest)), "3.0")
+		})
+	}
+
+	t.Run("a nullable []byte keeps its encoding", func(t *testing.T) {
+		type Resp struct {
+			Blob *[]byte `json:"blob"`
+		}
+		view := component(t, contractFor[struct{}, Resp](t), "Resp")
+		assert.JSONEq(t, `{"type":["string","null"],"contentEncoding":"base64"}`, jsonOf(t, propertyOf(t, view, "blob")))
+	})
+}
+
+// operationsOf returns the operations of every path in a frozen registry's
+// document, keyed "METHOD path".
+func operationsOf(t *testing.T, reg *Registry) map[string]map[string]any {
+	t.Helper()
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+	out := map[string]map[string]any{}
+	paths, _ := doc["paths"].(map[string]any)
+	for path, item := range paths {
+		for method, op := range item.(map[string]any) {
+			out[method+" "+path] = op.(map[string]any)
+		}
+	}
+	return out
+}
+
+func TestSchemaRequestBodyOnlyForBodyMethods(t *testing.T) {
+	type req struct {
+		ID   string `json:"-" path:"id"`
+		Name string `json:"name" validate:"required"`
+	}
+	reg := NewRegistry()
+	for _, method := range []string{http.MethodGet, http.MethodDelete, http.MethodPut, http.MethodPatch} {
+		Register(reg, Action[req, Empty]{
+			ID: "x." + method, Method: method, Path: "/x/{id}",
+			Statuses: []StatusDoc{{Code: http.StatusNoContent}},
+			Handle:   func(context.Context, req) (Empty, error) { return Empty{}, nil },
+		})
+	}
+	reg.Freeze()
+	ops := operationsOf(t, reg)
+	assert.NotContains(t, ops["get /x/{id}"], "requestBody")
+	assert.NotContains(t, ops["delete /x/{id}"], "requestBody")
+	assert.Contains(t, ops["put /x/{id}"], "requestBody")
+	assert.Contains(t, ops["patch /x/{id}"], "requestBody")
+	for _, op := range ops {
+		assert.Contains(t, op, "parameters", "parameters are documented for every method")
+	}
+}
+
+func TestSchemaParametersMatchBoundFields(t *testing.T) {
+	type embedded struct {
+		Inner string `json:"-" query:"inner"`
+	}
+	type req struct {
+		embedded
+
+		ID     uuid.UUID `json:"-" path:"id"`
+		Limit  *int      `json:"-" query:"limit" validate:"min=1,max=100"`
+		Trace  string    `json:"-" header:"X-Trace" validate:"required"`
+		hidden string    `query:"hidden"` //nolint:unused // unexported fields are neither bound nor documented
+	}
+	params := buildParameters(newSchemaBuilder(), reflect.TypeFor[*req]())
+	assert.JSONEq(t, `[
+		{"name":"id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},
+		{"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":100}},
+		{"name":"X-Trace","in":"header","required":true,"schema":{"type":"string"}}
+	]`, jsonOf(t, params))
+
+	assert.Nil(t, buildParameters(newSchemaBuilder(), reflect.TypeFor[int]()))
+	assert.NotNil(t, buildRequestBody(newSchemaBuilder(), http.MethodPost, reflect.TypeFor[*reqBody]()),
+		"a pointer request type documents its pointee's body")
+}
+
+func TestResponseSchemaUnwrapsPointerEnvelopes(t *testing.T) {
+	b := newSchemaBuilder()
+	schema, hasBody := b.responseSchema(reflect.TypeFor[*Created[SharedSame]]())
+	require.True(t, hasBody)
+	assert.Equal(t, map[string]any{"$ref": componentRef + "SharedSame"}, schema)
 }

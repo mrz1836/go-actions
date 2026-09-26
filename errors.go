@@ -127,15 +127,20 @@ func (r *Registry) writeError(w http.ResponseWriter, req *http.Request, err erro
 }
 
 // writeAPIError writes an already-mapped APIError as the standard JSON error
-// envelope, flattening any field details into the message, and sets Retry-After
-// when the error carries a positive RetryAfter. It is the single write path
-// shared by handler errors, panics, and the 404/405 defaults.
+// envelope and sets Retry-After when the error carries a positive RetryAfter.
+// Field details replace the message: "validation failed: " followed by each
+// "field: message" (just "message" when the field is empty), joined by "; ".
+// It is the single write path shared by handler errors, panics, and the
+// 404/405 defaults.
 func (r *Registry) writeAPIError(w http.ResponseWriter, req *http.Request, apiErr APIError) {
 	message := apiErr.Message
 	if len(apiErr.Fields) > 0 {
 		parts := make([]string, len(apiErr.Fields))
 		for i, fe := range apiErr.Fields {
-			parts[i] = fe.Field + ": " + fe.Message
+			parts[i] = fe.Message
+			if fe.Field != "" {
+				parts[i] = fe.Field + ": " + fe.Message
+			}
 		}
 		message = "validation failed: " + strings.Join(parts, "; ")
 	}

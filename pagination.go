@@ -1,9 +1,11 @@
 package actions
 
-// ClampLimit normalizes a requested page size into [1, ceiling], returning def
-// when limit is non-positive. It centralizes the "default then cap" policy every
-// list endpoint repeats, with the bounds supplied by the caller rather than
-// hardcoded so each surface keeps its own page-size policy.
+// ClampLimit normalizes a requested page size: a non-positive limit becomes def,
+// and a limit above ceiling becomes ceiling; any other limit is returned as is.
+// With 1 <= def <= ceiling the result is always in [1, ceiling] (def itself is
+// returned unchecked). It centralizes the "default then cap" policy every list
+// endpoint repeats, with the bounds supplied by the caller rather than hardcoded
+// so each surface keeps its own page-size policy.
 func ClampLimit(limit, def, ceiling int) int {
 	switch {
 	case limit <= 0:

@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // errOpaque is a static, non-API error used to exercise the redacted-500 path.
@@ -252,5 +255,42 @@ func TestErrorCodeValues(t *testing.T) {
 		if got != want {
 			t.Errorf("code value = %q, want %q", got, want)
 		}
+	}
+}
+
+func TestWriteAPIErrorFlattensFieldDetails(t *testing.T) {
+	reg := NewRegistry()
+	w := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", nil)
+	reg.writeAPIError(w, r, APIError{
+		Status: http.StatusUnprocessableEntity, Code: CodeValidation, Message: "ignored when fields are present",
+		Fields: []FieldError{{Field: "name", Message: "is required"}, {Message: "coupon expired"}},
+	})
+	assert.JSONEq(t, `{"error":"validation failed: name: is required; coupon expired","code":"VALIDATION_ERROR"}`, w.Body.String())
+}
+
+func TestWriteErrorOnZeroValueRegistry(t *testing.T) {
+	var reg Registry // no NewRegistry: errorMapper is nil
+	w := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+	reg.writeError(w, r, errPlain)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.JSONEq(t, `{"error":"an internal error occurred","code":"INTERNAL_ERROR"}`, w.Body.String())
+}
+
+// BenchmarkWriteAPIError measures writing a 422 with field details — the
+// flattening and envelope encoding every validation failure pays.
+func BenchmarkWriteAPIError(b *testing.B) {
+	reg := NewRegistry()
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/x", nil)
+	r.Header.Set("X-Request-ID", "req-1")
+	apiErr := APIError{
+		Status: http.StatusUnprocessableEntity, Code: CodeValidation, Message: "validation failed",
+		Fields: []FieldError{{Field: "name", Message: "is required"}, {Field: "email", Message: "must be a valid email address"}},
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		reg.writeAPIError(httptest.NewRecorder(), r, apiErr)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/mrz1836/go-actions"
+	"github.com/mrz1836/go-actions/examples/petstore"
 )
 
 func frozenPingRegistry(t *testing.T, opts ...actions.Option) *actions.Registry {
@@ -45,6 +46,20 @@ func TestOpenAPI_DocumentComplete(t *testing.T) {
 	components, _ := doc["components"].(map[string]any)
 	schemas, _ := components["schemas"].(map[string]any)
 	assert.Contains(t, schemas, "Error")
+}
+
+func TestOpenAPI_OperationDescription(t *testing.T) {
+	a := pingAction()
+	a.Description = "Long-form notes for the operation."
+	reg := actions.NewRegistry()
+	actions.Register(reg, a)
+	reg.Freeze()
+
+	var doc struct {
+		Paths map[string]map[string]map[string]any `json:"paths"`
+	}
+	require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+	assert.Equal(t, a.Description, doc.Paths["/ping"]["post"]["description"])
 }
 
 // TestOpenAPI_InfoIsConfigurable verifies WithInfo drives the info block and
@@ -372,6 +387,17 @@ func BenchmarkBuildOpenAPI(b *testing.B) {
 		reg := actions.NewRegistry()
 		actions.Register(reg, getItemAction())
 		actions.Register(reg, deleteItemAction())
+		reg.Freeze()
+		_ = reg.OpenAPIJSON()
+	}
+}
+
+// BenchmarkBuildOpenAPIPetstore measures building the example pet-store
+// contract: three actions with path, query, and body binding.
+func BenchmarkBuildOpenAPIPetstore(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		reg := petstore.Registry()
 		reg.Freeze()
 		_ = reg.OpenAPIJSON()
 	}

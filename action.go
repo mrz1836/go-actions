@@ -20,7 +20,7 @@ import (
 // Accepted[T], Response[T], or any struct.
 type Action[Req, Resp any] struct {
 	ID          string // operationId, dotted snake — unique across the registry
-	Method      string // "GET", "POST", "PATCH", ...
+	Method      string // "GET", "POST", "PATCH", ... (case-insensitive; uppercased at Register)
 	Path        string // chi-style, e.g. "/persons/{id}"
 	Summary     string
 	Description string
@@ -37,13 +37,19 @@ type Action[Req, Resp any] struct {
 	// — it emits "security: []" so the operation opts out of any global
 	// requirement.
 	Security []SecurityRequirement
-	// Timeout, when > 0, bounds the handler with a context deadline; a handler
-	// that honors ctx and overruns yields a 504.
+	// Timeout, when > 0, bounds the request context with a deadline. A handler
+	// that returns an error once the context's deadline has passed yields a
+	// 504 TIMEOUT, whatever error it returned; one that returns successfully is
+	// encoded as usual. The handler must honor ctx for the deadline to cut it
+	// short.
 	Timeout time.Duration
-	// Middleware wraps only this action's handler, innermost-first. Use it for
-	// per-route concerns such as authentication on a single endpoint.
+	// Middleware wraps only this action's handler; the first entry is the
+	// outermost. It runs inside the framework's per-action layers (observer,
+	// panic recovery, timeout, body cap) and before the request is decoded. Use
+	// it for per-route concerns such as authentication on a single endpoint.
 	Middleware []Middleware
 
+	// Handle serves the decoded, validated request. It must not be nil.
 	Handle func(ctx context.Context, req Req) (Resp, error)
 }
 
@@ -83,7 +89,9 @@ type Accepted[T any] struct{ Body T }
 // Response wraps a body with an explicit status and optional response headers,
 // for handlers that need control beyond Created/Accepted/Empty — e.g. setting
 // Cache-Control or ETag, or returning a non-standard 2xx. Status defaults to 200
-// when zero. For OpenAPI schema generation it unwraps to its Body type.
+// when zero. Headers are added to the response before the body is written. For
+// OpenAPI schema generation it unwraps to its Body type; because its status is
+// chosen at runtime, Freeze cannot check that the status is documented.
 type Response[T any] struct {
 	Status int
 	Header http.Header
@@ -141,6 +149,7 @@ type anyAction struct {
 	middleware  []Middleware
 	reqType     reflect.Type
 	respType    reflect.Type
+	hasHandle   bool
 	handler     http.HandlerFunc
 }
 
@@ -203,9 +212,11 @@ func NewRegistry(opts ...Option) *Registry {
 	return r
 }
 
-// Register is the only typed seam. It builds the http.HandlerFunc
-// (decode → validate → Handle → encode) and stores it keyed by ID. It panics if
-// the registry is already frozen.
+// Register is the only typed seam. It uppercases the action's Method, compiles
+// the request's binding and validation plans once, builds the http.HandlerFunc
+// (decode → validate → Handle → encode), and stores it for Freeze to check. It
+// panics if the registry is already frozen; every other declaration error is
+// reported by Freeze.
 func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
@@ -213,17 +224,31 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 		panic("actions: Register called after Freeze")
 	}
 
+	method := strings.ToUpper(a.Method)
+	reqType := reflect.TypeFor[Req]()
+	binder := binderFor(reqType)
+	var val *validator
+	if st := structType(reqType); st != nil {
+		val = validatorFor(st)
+	}
+	withBody := methodHasBody(method)
 	handle := a.Handle
 	strict := reg.strictDecoding
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		req, err := decodeRequest[Req](r, strict)
-		if err != nil {
+		var req Req
+		rv := reflect.ValueOf(&req).Elem()
+		if err := binder.bind(r, rv, withBody, strict); err != nil {
 			reg.writeError(w, r, err)
 			return
 		}
-		if verr := validateRequest(&req); verr != nil {
-			reg.writeError(w, r, verr)
-			return
+		if val != nil {
+			for rv.Kind() == reflect.Pointer {
+				rv = rv.Elem() // allocated by bind
+			}
+			if verr := val.validate(rv, nil); verr != nil {
+				reg.writeError(w, r, verr)
+				return
+			}
 		}
 		resp, herr := handle(r.Context(), req)
 		if herr != nil {
@@ -241,7 +266,7 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 
 	reg.actions = append(reg.actions, anyAction{
 		id:          a.ID,
-		method:      a.Method,
+		method:      method,
 		path:        a.Path,
 		summary:     a.Summary,
 		description: a.Description,
@@ -251,15 +276,37 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 		security:    a.Security,
 		timeout:     a.Timeout,
 		middleware:  a.Middleware,
-		reqType:     reflect.TypeFor[Req](),
+		reqType:     reqType,
 		respType:    reflect.TypeFor[Resp](),
+		hasHandle:   handle != nil,
 		handler:     handler,
 	})
 }
 
-// Freeze seals the registry. It validates every action declaration and panics
-// on a malformed action, a duplicate ID, or a duplicate Method+Path, then builds
-// the OpenAPI document and the _actions index. After Freeze, Register panics.
+// structType returns t, or the type it points to, when that is a struct, and
+// nil otherwise.
+func structType(t reflect.Type) reflect.Type {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	return t
+}
+
+// Freeze seals the registry. It validates every action declaration, then builds
+// the OpenAPI document and the _actions index; after Freeze, Register panics.
+// Calling Freeze again is a no-op. It panics on:
+//
+//   - an empty ID or Method, or a Path that does not start with "/";
+//   - no Statuses, a nil Handle, or a HeaderDoc with an empty Name;
+//   - a Resp whose success status (204 for Empty, 201 for Created, 202 for
+//     Accepted, 200 otherwise) is not documented by a non-error StatusDoc —
+//     Response[T], whose status is chosen at runtime, is exempt;
+//   - a duplicate ID, or two actions routing the same Method and path;
+//   - two distinct types sharing a component schema name, a type named Error,
+//     or a <Name>Input name already taken (see the schema generator).
 func (r *Registry) Freeze() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -303,10 +350,12 @@ func (r *Registry) Handler() http.Handler {
 	return chain(mux, muxMW...)
 }
 
-// OpenAPIJSON returns the pre-built OpenAPI 3.1 JSON bytes. Valid after Freeze.
+// OpenAPIJSON returns the pre-built OpenAPI document, in the declared dialect
+// (see WithOpenAPIVersion), as indented JSON. It is nil before Freeze.
 func (r *Registry) OpenAPIJSON() []byte { return r.openapiJSON }
 
-// OpenAPIYAML returns the pre-built OpenAPI 3.1 YAML bytes. Valid after Freeze.
+// OpenAPIYAML returns the same OpenAPI document as OpenAPIJSON, serialized as
+// YAML. It is nil before Freeze.
 func (r *Registry) OpenAPIYAML() []byte { return r.openapiYAML }
 
 // wrapAction composes one action's handler with its framework and per-action
@@ -359,7 +408,7 @@ func (r *Registry) methodNotAllowedHandler() http.Handler {
 // validateActions panics on any structurally invalid or conflicting action.
 func (r *Registry) validateActions() {
 	seenID := make(map[string]bool, len(r.actions))
-	seenRoute := make(map[string]bool, len(r.actions))
+	seenRoute := make(map[string]string, len(r.actions))
 	for _, a := range r.actions {
 		switch {
 		case a.id == "":
@@ -370,19 +419,65 @@ func (r *Registry) validateActions() {
 			panic(fmt.Sprintf("actions: action %q has an invalid Path %q", a.id, a.path))
 		case len(a.statuses) == 0:
 			panic(fmt.Sprintf("actions: action %q documents no Statuses", a.id))
+		case !a.hasHandle:
+			panic(fmt.Sprintf("actions: action %q has a nil Handle", a.id))
 		}
 		validateHeaderDocs(a)
+		validateSuccessStatus(a)
 		if seenID[a.id] {
 			panic(fmt.Sprintf("actions: duplicate action ID %q", a.id))
 		}
 		seenID[a.id] = true
 
-		route := a.method + " " + a.path
-		if seenRoute[route] {
-			panic(fmt.Sprintf("actions: duplicate route %q", route))
+		// Compare mounted paths: with WithStripPrefix, "/v1/x" and "/x" route
+		// alike and chi would silently keep only one.
+		route := a.method + " " + r.mountPath(a.path)
+		if other, dup := seenRoute[route]; dup {
+			panic(fmt.Sprintf("actions: duplicate route %q (actions %q and %q)", route, other, a.id))
 		}
-		seenRoute[route] = true
+		seenRoute[route] = a.id
 	}
+}
+
+// headerEnvelopeType is the reflect.Type of the headerEnvelope interface,
+// implemented only by Response[T].
+//
+//nolint:gochecknoglobals // a cached reflect.Type is an intentional package global
+var headerEnvelopeType = reflect.TypeFor[headerEnvelope]()
+
+// successStatus returns the status the encoder writes for a successful
+// response of type t, and false when that status is chosen at runtime: by a
+// Response[T], or by the dynamic type behind an interface.
+func successStatus(t reflect.Type) (int, bool) {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch {
+	case t.Kind() == reflect.Interface, t.Implements(headerEnvelopeType):
+		return 0, false
+	case t.Implements(envelopeType):
+		env, _ := reflect.Zero(t).Interface().(responseEnvelope)
+		return env.envelopeStatus(), true
+	default:
+		return http.StatusOK, true
+	}
+}
+
+// validateSuccessStatus panics when an action's success status is not
+// documented by a non-error StatusDoc, so the contract states the status the
+// encoder actually writes.
+func validateSuccessStatus(a anyAction) {
+	status, fixed := successStatus(a.respType)
+	if !fixed {
+		return
+	}
+	for _, sd := range a.statuses {
+		if sd.Code == status && !sd.Error {
+			return
+		}
+	}
+	panic(fmt.Sprintf("actions: action %q responds %d on success (Resp %s) but documents no non-error %d StatusDoc",
+		a.id, status, a.respType, status))
 }
 
 // validateHeaderDocs panics on a documented response header without a name.

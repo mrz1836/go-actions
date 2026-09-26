@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -314,4 +315,90 @@ func TestE2E_StrictDecoding(t *testing.T) {
 		assert.Equal(t, http.StatusAccepted, status)
 		assert.Equal(t, "hi jane", got["greeting"])
 	})
+}
+
+// Request and response types for BenchmarkHandler.
+type (
+	benchCreateReq struct {
+		Name  string `json:"name" validate:"required,max=64"`
+		Email string `json:"email" validate:"required,email"`
+	}
+	benchGetReq struct {
+		ID     string `json:"-" path:"id" validate:"required"`
+		Expand bool   `json:"-" query:"expand"`
+		Limit  int    `json:"-" query:"limit" validate:"max=100"`
+		Trace  string `json:"-" header:"X-Trace-Id"`
+	}
+	benchUser struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Email string `json:"email,omitempty"`
+	}
+)
+
+// benchHandler returns the frozen handler of a two-action registry: a
+// validated JSON create and a parameter-bound get.
+func benchHandler(opts ...actions.Option) http.Handler {
+	reg := actions.NewRegistry(opts...)
+	actions.Register(reg, actions.Action[benchCreateReq, actions.Created[benchUser]]{
+		ID: "users.create", Method: http.MethodPost, Path: "/users", Summary: "Create a user",
+		Statuses: []actions.StatusDoc{
+			{Code: http.StatusCreated, Description: "created"},
+			{Code: http.StatusUnprocessableEntity, Description: "invalid", Error: true},
+		},
+		Handle: func(_ context.Context, req benchCreateReq) (actions.Created[benchUser], error) {
+			return actions.Created[benchUser]{Body: benchUser{ID: "u_1", Name: req.Name, Email: req.Email}}, nil
+		},
+	})
+	actions.Register(reg, actions.Action[benchGetReq, benchUser]{
+		ID: "users.get", Method: http.MethodGet, Path: "/users/{id}", Summary: "Get a user",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK, Description: "the user"}},
+		Handle: func(_ context.Context, req benchGetReq) (benchUser, error) {
+			return benchUser{ID: req.ID, Name: "Ada"}, nil
+		},
+	})
+	reg.Freeze()
+	return reg.Handler()
+}
+
+// BenchmarkHandler measures whole requests through Registry.Handler — routing,
+// the framework middleware, decode, validate, handle, and encode — for the
+// common outcomes.
+func BenchmarkHandler(b *testing.B) {
+	plain := benchHandler()
+	observed := benchHandler(actions.WithObserver(func(actions.Observation) {}))
+	const created = `{"name":"Ada","email":"ada@example.com"}`
+	cases := []struct {
+		name    string
+		handler http.Handler
+		method  string
+		target  string
+		body    string
+		want    int
+	}{
+		{"create_201", plain, http.MethodPost, "/users", created, http.StatusCreated},
+		{"validation_422", plain, http.MethodPost, "/users", `{"name":"","email":"nope"}`, http.StatusUnprocessableEntity},
+		{"get_params_200", plain, http.MethodGet, "/users/u_1?expand=true&limit=10", "", http.StatusOK},
+		{"not_found_404", plain, http.MethodGet, "/nope", "", http.StatusNotFound},
+		{"with_observer", observed, http.MethodPost, "/users", created, http.StatusCreated},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				var body io.Reader
+				if tc.body != "" {
+					body = strings.NewReader(tc.body)
+				}
+				r := httptest.NewRequestWithContext(context.Background(), tc.method, tc.target, body)
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set("X-Trace-Id", "t-1")
+				w := httptest.NewRecorder()
+				tc.handler.ServeHTTP(w, r)
+				if w.Code != tc.want {
+					b.Fatalf("status = %d, want %d: %s", w.Code, tc.want, w.Body.String())
+				}
+			}
+		})
+	}
 }
