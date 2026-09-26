@@ -17,18 +17,18 @@ import (
 // decodeRequest binds an incoming *http.Request into a typed Req value. JSON
 // body fields bind from the request body; fields tagged path/query/header bind
 // from the URL, query string, and headers respectively. A field with no
-// binding tag is ignored. A malformed JSON body yields a 400; a path/query/
-// header value that cannot be converted yields a 422.
+// binding tag is ignored. A malformed JSON body yields a 400 (see decodeBody for
+// strict mode); a path/query/header value that cannot be converted yields a 422.
 //
 //nolint:gocognit,gocyclo // one loop over a struct's binding tags
-func decodeRequest[Req any](r *http.Request) (Req, error) {
+func decodeRequest[Req any](r *http.Request, strict bool) (Req, error) {
 	var req Req
 	rv := reflect.ValueOf(&req).Elem()
 	if rv.Kind() != reflect.Struct {
 		return req, nil
 	}
 
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(r, &req, strict); err != nil {
 		return req, err
 	}
 
@@ -61,35 +61,72 @@ func decodeRequest[Req any](r *http.Request) (Req, error) {
 	return req, nil
 }
 
+// jsonMediaType is the Content-Type prefix whose request bodies are decoded.
+const jsonMediaType = "application/json"
+
+// malformedBodyMessage is the client-facing message for a body that fails to
+// decode. Strict mode sends it alone, with no parser detail.
+const malformedBodyMessage = "malformed JSON body"
+
 // decodeBody decodes a JSON request body into req when the request carries one.
-func decodeBody[Req any](r *http.Request, req *Req) error {
+// The JSON media type matches case-insensitively (RFC 9110). In strict mode
+// (WithStrictDecoding) an unknown field, or any data after the first JSON
+// value, is rejected, and every malformed body carries only the generic
+// message.
+func decodeBody[Req any](r *http.Request, req *Req, strict bool) error {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodDelete {
 		return nil
 	}
-	ct := r.Header.Get("Content-Type")
-	if ct != "" && !strings.HasPrefix(ct, "application/json") {
+	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
 		return nil
 	}
 	dec := json.NewDecoder(r.Body)
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(req); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			return &APIError{
-				Status:  http.StatusRequestEntityTooLarge,
-				Code:    CodePayloadTooLarge,
-				Message: "request body too large",
-			}
-		}
-		return &APIError{
-			Status:  http.StatusBadRequest,
-			Code:    CodeBadRequest,
-			Message: "malformed JSON body: " + err.Error(),
+		return bodyError(err, strict)
+	}
+	if strict {
+		// Exactly one JSON value: anything but whitespace after it is rejected.
+		if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return bodyError(err, strict)
 		}
 	}
 	return nil
+}
+
+// isJSONContentType reports whether ct starts with the JSON media type,
+// ignoring case.
+func isJSONContentType(ct string) bool {
+	return len(ct) >= len(jsonMediaType) && strings.EqualFold(ct[:len(jsonMediaType)], jsonMediaType)
+}
+
+// bodyError maps a body decode failure to an APIError: a 413 when the body
+// exceeded the size cap, otherwise a 400 whose message appends the parser
+// detail only outside strict mode. err may be nil in strict mode (a second,
+// well-formed value followed the first).
+func bodyError(err error, strict bool) error {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return &APIError{
+			Status:  http.StatusRequestEntityTooLarge,
+			Code:    CodePayloadTooLarge,
+			Message: "request body too large",
+		}
+	}
+	message := malformedBodyMessage
+	if !strict && err != nil {
+		message += ": " + err.Error()
+	}
+	return &APIError{
+		Status:  http.StatusBadRequest,
+		Code:    CodeBadRequest,
+		Message: message,
+	}
 }
 
 // errInvalidTime signals that a time-typed parameter could not be parsed.

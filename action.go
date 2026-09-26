@@ -151,6 +151,7 @@ type Registry struct {
 	// runtime configuration
 	middleware       []Middleware
 	maxBodyBytes     int64
+	strictDecoding   bool
 	observer         ObserveFunc
 	requestIDGen     func() string
 	notFound         http.Handler
@@ -196,8 +197,9 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 	}
 
 	handle := a.Handle
+	strict := reg.strictDecoding
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		req, err := decodeRequest[Req](r)
+		req, err := decodeRequest[Req](r, strict)
 		if err != nil {
 			reg.writeError(w, r, err)
 			return
