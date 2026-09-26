@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // errOpaque is a static, non-API error used to exercise the redacted-500 path.
@@ -142,6 +143,89 @@ func TestWriteError(t *testing.T) {
 		reg.writeError(w, r, errOpaque)
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500", w.Code)
+		}
+	})
+}
+
+func TestWriteError_RetryAfter(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		retryAfter time.Duration
+		want       string // "" means the header must be absent
+	}{
+		{name: "fractional seconds round up", retryAfter: 1500 * time.Millisecond, want: "2"},
+		{name: "sub-second rounds up to one", retryAfter: 10 * time.Millisecond, want: "1"},
+		{name: "whole seconds are exact", retryAfter: 90 * time.Second, want: "90"},
+		{name: "zero omits the header", retryAfter: 0, want: ""},
+		{name: "negative omits the header", retryAfter: -time.Second, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := NewRegistry()
+			w := httptest.NewRecorder()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", nil)
+			reg.writeError(w, r, &APIError{
+				Status:     http.StatusTooManyRequests,
+				Code:       CodeTooManyRequests,
+				Message:    "slow down",
+				RetryAfter: tc.retryAfter,
+			})
+
+			if w.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", w.Code)
+			}
+			got, present := w.Header()["Retry-After"]
+			switch {
+			case tc.want == "" && present:
+				t.Fatalf("Retry-After = %q, want absent", got)
+			case tc.want != "" && w.Header().Get("Retry-After") != tc.want:
+				t.Fatalf("Retry-After = %q, want %q", w.Header().Get("Retry-After"), tc.want)
+			}
+		})
+	}
+
+	t.Run("the envelope body is unchanged", func(t *testing.T) {
+		t.Parallel()
+		write := func(retryAfter time.Duration) string {
+			reg := NewRegistry()
+			w := httptest.NewRecorder()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", nil)
+			r.Header.Set("X-Request-ID", "req-1")
+			reg.writeError(w, r, &APIError{
+				Status:     http.StatusTooManyRequests,
+				Code:       CodeTooManyRequests,
+				Message:    "slow down",
+				RetryAfter: retryAfter,
+			})
+			return w.Body.String()
+		}
+		with, without := write(3*time.Second), write(0)
+		if with != without {
+			t.Fatalf("body with Retry-After = %q, without = %q", with, without)
+		}
+		var body errorResponse
+		if err := json.Unmarshal([]byte(with), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.Code != CodeTooManyRequests || body.Error != "slow down" || body.RequestID != "req-1" {
+			t.Fatalf("body = %+v", body)
+		}
+	})
+
+	t.Run("a custom mapper can set it", func(t *testing.T) {
+		t.Parallel()
+		mapper := func(error) APIError {
+			return APIError{Status: http.StatusServiceUnavailable, Code: CodeServiceUnavailable, Message: "busy", RetryAfter: 5 * time.Second}
+		}
+		reg := NewRegistry(WithErrorMapper(mapper))
+		w := httptest.NewRecorder()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+		reg.writeError(w, r, errOpaque)
+		if got := w.Header().Get("Retry-After"); got != "5" {
+			t.Fatalf("Retry-After = %q, want 5", got)
 		}
 	})
 }

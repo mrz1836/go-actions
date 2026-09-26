@@ -293,10 +293,11 @@ transport-level `APIError`, decoupling the framework from your domain error mode
 
 ```go
 type APIError struct {
-	Status  int
-	Code    string
-	Message string
-	Fields  []FieldError
+	Status     int
+	Code       string
+	Message    string
+	Fields     []FieldError
+	RetryAfter time.Duration // > 0 sets the Retry-After header
 }
 
 type ErrorMapper func(error) APIError
@@ -325,6 +326,20 @@ The default mapper passes an `*APIError` through unchanged (so handlers may retu
 directly) and maps every other error to a redacted 500, ensuring internal detail never
 reaches the wire. The error envelope is always
 `{"error": ..., "code": ..., "request_id": ...}`.
+
+Set `RetryAfter` to tell clients when to try again, typically on a `429` or `503`. When
+it is positive, the response carries a `Retry-After` header in whole seconds, rounded up
+with a minimum of 1 (so `1500 * time.Millisecond` sends `Retry-After: 2`). The header is
+omitted when `RetryAfter` is zero, and the JSON body is the same either way:
+
+```go
+return actions.APIError{
+	Status:     http.StatusTooManyRequests,
+	Code:       actions.CodeTooManyRequests,
+	Message:    "too many requests; please try again later",
+	RetryAfter: 30 * time.Second,
+}
+```
 
 The contract documents the envelope as the `Error` component: `error` and `code` are
 required, and `request_id` is optional (it is omitted when empty). To give generated

@@ -3,8 +3,11 @@ package actions
 import (
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Stable, transport-level error codes. These are generic HTTP error codes with
@@ -47,11 +50,16 @@ type FieldError struct {
 // a stable code, a human message, and an optional field-keyed detail list. It
 // implements error, so handlers may return it directly, and an ErrorMapper may
 // produce it from any domain error.
+//
+// RetryAfter, when positive, is written as a Retry-After header in whole
+// seconds (rounded up, minimum 1) — typically on a 429 or 503. It never appears
+// in the JSON body.
 type APIError struct {
-	Status  int
-	Code    string
-	Message string
-	Fields  []FieldError
+	Status     int
+	Code       string
+	Message    string
+	Fields     []FieldError
+	RetryAfter time.Duration
 }
 
 // Error implements the error interface.
@@ -119,8 +127,9 @@ func (r *Registry) writeError(w http.ResponseWriter, req *http.Request, err erro
 }
 
 // writeAPIError writes an already-mapped APIError as the standard JSON error
-// envelope, flattening any field details into the message. It is the single
-// write path shared by handler errors, panics, and the 404/405 defaults.
+// envelope, flattening any field details into the message, and sets Retry-After
+// when the error carries a positive RetryAfter. It is the single write path
+// shared by handler errors, panics, and the 404/405 defaults.
 func (r *Registry) writeAPIError(w http.ResponseWriter, req *http.Request, apiErr APIError) {
 	message := apiErr.Message
 	if len(apiErr.Fields) > 0 {
@@ -129,6 +138,9 @@ func (r *Registry) writeAPIError(w http.ResponseWriter, req *http.Request, apiEr
 			parts[i] = fe.Field + ": " + fe.Message
 		}
 		message = "validation failed: " + strings.Join(parts, "; ")
+	}
+	if apiErr.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(apiErr.RetryAfter.Seconds())))))
 	}
 	writeJSON(w, apiErr.Status, errorResponse{
 		Error:     message,
