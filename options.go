@@ -100,6 +100,17 @@ func WithMaxBodyBytes(n int64) Option {
 	}
 }
 
+// WithStrictDecoding makes JSON request-body decoding strict: a body with an
+// unknown field, or with any data after its first JSON value, is rejected with a
+// 400, and every malformed body yields the message "malformed JSON body" with no
+// parser detail echoed to the client. Without it, unknown fields and trailing
+// data are tolerated and a parse error appends the parser's detail.
+func WithStrictDecoding() Option {
+	return func(r *Registry) {
+		r.strictDecoding = true
+	}
+}
+
 // WithObserver installs a per-request observability hook invoked after each
 // action completes with its id, status, latency, and error (panics included).
 // It is the seam for access logging, metrics, and tracing. A nil hook is

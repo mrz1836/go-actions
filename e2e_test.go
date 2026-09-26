@@ -240,3 +240,78 @@ func TestE2E_Concurrent(t *testing.T) {
 		assert.Equalf(t, calls[i%len(calls)].want, statuses[i], "worker %d", i)
 	}
 }
+
+// postWithType posts body with the given Content-Type and returns the status and
+// the decoded JSON response object.
+func postWithType(t *testing.T, url, contentType, body string) (int, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", contentType)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	return resp.StatusCode, got
+}
+
+// TestE2E_StrictDecoding drives WithStrictDecoding through a served registry:
+// every malformed body is a 400 carrying only the generic message, a valid body
+// is decoded, a mixed-case JSON content type is honored, and the 413 body cap
+// still applies. Without the option, an unknown field is still accepted.
+func TestE2E_StrictDecoding(t *testing.T) {
+	t.Parallel()
+	reg := actions.NewRegistry(actions.WithStrictDecoding())
+	actions.Register(reg, pingAction())
+	strictURL := actiontest.NewServer(t, reg).URL + "/ping"
+
+	t.Run("malformed bodies are a generic 400", func(t *testing.T) {
+		t.Parallel()
+		for _, body := range []string{
+			`{"name":"jane","x":1}`,
+			`{"name":"jane"}{}`,
+			`{"name":"jane"} garbage`,
+			`{"name":`,
+		} {
+			status, got := postWithType(t, strictURL, "application/json", body)
+			assert.Equal(t, http.StatusBadRequest, status, body)
+			assert.Equal(t, actions.CodeBadRequest, got["code"], body)
+			assert.Equal(t, "malformed JSON body", got["error"], body)
+		}
+	})
+
+	t.Run("a valid body is decoded", func(t *testing.T) {
+		t.Parallel()
+		status, got := postWithType(t, strictURL, "application/json", `{"name":"jane"}`)
+		assert.Equal(t, http.StatusAccepted, status)
+		assert.Equal(t, "hi jane", got["greeting"])
+	})
+
+	t.Run("a mixed-case JSON content type is decoded", func(t *testing.T) {
+		t.Parallel()
+		status, got := postWithType(t, strictURL, "Application/JSON", `{"name":"jane"}`)
+		assert.Equal(t, http.StatusAccepted, status)
+		assert.Equal(t, "hi jane", got["greeting"])
+	})
+
+	t.Run("the body cap still yields 413", func(t *testing.T) {
+		t.Parallel()
+		capped := actions.NewRegistry(actions.WithStrictDecoding(), actions.WithMaxBodyBytes(8))
+		actions.Register(capped, pingAction())
+		url := actiontest.NewServer(t, capped).URL + "/ping"
+		status, got := postWithType(t, url, "application/json", `{"name":"a-name-well-over-eight-bytes"}`)
+		assert.Equal(t, http.StatusRequestEntityTooLarge, status)
+		assert.Equal(t, actions.CodePayloadTooLarge, got["code"])
+	})
+
+	t.Run("without the option an unknown field is accepted", func(t *testing.T) {
+		t.Parallel()
+		lenient := actions.NewRegistry()
+		actions.Register(lenient, pingAction())
+		url := actiontest.NewServer(t, lenient).URL + "/ping"
+		status, got := postWithType(t, url, "application/json", `{"name":"jane","x":1}`)
+		assert.Equal(t, http.StatusAccepted, status)
+		assert.Equal(t, "hi jane", got["greeting"])
+	})
+}

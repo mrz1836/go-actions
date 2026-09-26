@@ -218,6 +218,20 @@ Handle: func(ctx context.Context, req listReq) (actions.Page[user], error) {
 }
 ```
 
+JSON body fields bind when the request's `Content-Type` is empty or starts with
+`application/json`, matched case-insensitively (so `Application/JSON` works too); any
+other content type skips body decoding. A body that fails to parse is a
+`400 BAD_REQUEST`. By default, unknown fields and data after the first JSON value are
+tolerated, and the message includes the parser's detail. `WithStrictDecoding()` rejects
+both and answers every malformed body with exactly `malformed JSON body`, so no parser
+internals reach the client:
+
+```go
+reg := actions.NewRegistry(actions.WithStrictDecoding())
+// {"name":"jane","x":1}  → 400 {"error":"malformed JSON body","code":"BAD_REQUEST"}
+// {"name":"jane"} {}     → 400 (trailing data)
+```
+
 Path, query, and header parameters bind by struct tag (`path:`, `query:`,
 `header:`). Scalars convert automatically — `string`, `bool`, the integer and
 float kinds, and `time.Time` (parsed as RFC3339 or a bare `2006-01-02` date; a
@@ -348,6 +362,7 @@ reg := actions.NewRegistry(actions.WithErrorMapper(foundationx.NewErrorMapper())
 | `WithStripPrefix(prefix)`       | Strips a namespace prefix from each action's `Path` when routing (e.g. when the registry is mounted under that prefix). |
 | `WithMiddleware(mw...)`         | Registry-wide middleware applied to every route (actions, self-docs, `404`/`405`). |
 | `WithMaxBodyBytes(n)`           | Caps the request body (default 1 MiB; `0` disables). Over-limit ⇒ `413`. |
+| `WithStrictDecoding()`          | Rejects JSON bodies with unknown fields or trailing data (`400`, message exactly `malformed JSON body`, no parser detail). |
 | `WithObserver(fn)`              | Per-request hook with action id, status, latency, and error.       |
 | `WithRequestIDGenerator(fn)`    | Overrides how a correlation id is minted when none is inbound (default UUIDv4). |
 | `WithNotFoundHandler(h)` / `WithMethodNotAllowedHandler(h)` | Override the JSON `404` / `405` defaults. |

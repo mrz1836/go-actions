@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,7 +34,7 @@ func TestDecodeRequest(t *testing.T) {
 			strings.NewReader(`{"phone":"+13055551234","email":"jane@example.com"}`))
 		r.Header.Set("Content-Type", "application/json")
 
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -45,7 +46,7 @@ func TestDecodeRequest(t *testing.T) {
 	t.Run("non-struct request type is a no-op", func(t *testing.T) {
 		t.Parallel()
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
-		got, err := decodeRequest[int](r)
+		got, err := decodeRequest[int](r, false)
 		if err != nil || got != 0 {
 			t.Fatalf("decoded = %v, err = %v", got, err)
 		}
@@ -58,7 +59,7 @@ func TestDecodeRequest(t *testing.T) {
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/leads", strings.NewReader(``))
 		r.Header.Set("Content-Type", "application/json")
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -75,7 +76,7 @@ func TestDecodeRequest(t *testing.T) {
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/leads",
 			strings.NewReader(`not json`))
 		r.Header.Set("Content-Type", "text/plain")
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -92,7 +93,7 @@ func TestDecodeRequest(t *testing.T) {
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/leads", strings.NewReader(`{"phone":`))
 		r.Header.Set("Content-Type", "application/json")
 
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) {
 			t.Fatalf("error = %v, want *APIError", err)
@@ -114,7 +115,7 @@ func TestDecodeRequest(t *testing.T) {
 		r.Header.Set("X-Request-ID", "req-9")
 		r = withURLParam(r, "id", "abc")
 
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -130,7 +131,7 @@ func TestDecodeRequest(t *testing.T) {
 			Score  float64 `json:"-" query:"score"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?active=true&score=1.5", nil)
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -145,7 +146,7 @@ func TestDecodeRequest(t *testing.T) {
 			Limit int `json:"-" query:"limit"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?limit=abc", nil)
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 			t.Fatalf("error = %v, want 422 *APIError", err)
@@ -158,7 +159,7 @@ func TestDecodeRequest(t *testing.T) {
 			Active bool `json:"-" query:"active"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?active=maybe", nil)
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 			t.Fatalf("error = %v, want 422 *APIError", err)
@@ -171,7 +172,7 @@ func TestDecodeRequest(t *testing.T) {
 			Score float64 `json:"-" query:"score"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?score=high", nil)
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 			t.Fatalf("error = %v, want 422 *APIError", err)
@@ -184,7 +185,7 @@ func TestDecodeRequest(t *testing.T) {
 			Limit uint `json:"-" query:"limit"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?limit=25", nil)
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -199,7 +200,7 @@ func TestDecodeRequest(t *testing.T) {
 			Limit uint `json:"-" query:"limit"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?limit=-5", nil)
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 			t.Fatalf("error = %v, want 422 *APIError", err)
@@ -212,7 +213,7 @@ func TestDecodeRequest(t *testing.T) {
 			From time.Time `json:"-" query:"from"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?from=2026-06-24T10:30:00Z", nil)
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -227,7 +228,7 @@ func TestDecodeRequest(t *testing.T) {
 			Day time.Time `json:"-" query:"day"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?day=2026-06-24", nil)
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -242,7 +243,7 @@ func TestDecodeRequest(t *testing.T) {
 			From time.Time `json:"-" query:"from"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?from=not-a-time", nil)
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity {
 			t.Fatalf("error = %v, want 422 *APIError", err)
@@ -257,7 +258,7 @@ func TestDecodeRequest(t *testing.T) {
 			From   *time.Time `json:"-" query:"from"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?active=false&limit=10&from=2026-06-24T00:00:00Z", nil)
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -278,7 +279,7 @@ func TestDecodeRequest(t *testing.T) {
 			Active *bool `json:"-" query:"active"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
-		got, err := decodeRequest[req](r)
+		got, err := decodeRequest[req](r, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -295,7 +296,7 @@ func TestDecodeRequest(t *testing.T) {
 			Tags []string `json:"-" query:"tags"`
 		}
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?tags=a", nil)
-		_, err := decodeRequest[req](r)
+		_, err := decodeRequest[req](r, false)
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
 			t.Fatalf("error = %v, want 500 *APIError", err)
@@ -306,8 +307,151 @@ func TestDecodeRequest(t *testing.T) {
 	})
 }
 
+// TestDecodeRequestStrict pins the strict mode enabled by WithStrictDecoding:
+// unknown fields and trailing data are rejected, and every malformed body
+// yields the same generic message with no parser detail.
+func TestDecodeRequestStrict(t *testing.T) {
+	t.Parallel()
+	type req struct {
+		Email string `json:"email"`
+	}
+
+	rejected := []struct {
+		name string
+		body string
+	}{
+		{"unknown field", `{"email":"a@b.co","x":1}`},
+		{"trailing value", `{"email":"a@b.co"}{"x":1}`},
+		{"trailing empty object", `{} {}`},
+		{"trailing garbage", `{} garbage`},
+		{"syntax error", `{"email":`},
+		{"wrong type", `{"email":1}`},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", "application/json")
+
+			_, err := decodeRequest[req](r, true)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error = %v, want *APIError", err)
+			}
+			if apiErr.Status != http.StatusBadRequest || apiErr.Code != CodeBadRequest {
+				t.Fatalf("got %d %s, want 400 %s", apiErr.Status, apiErr.Code, CodeBadRequest)
+			}
+			if apiErr.Message != "malformed JSON body" {
+				t.Fatalf("message = %q, want exactly %q", apiErr.Message, "malformed JSON body")
+			}
+		})
+	}
+
+	accepted := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"single value", `{"email":"a@b.co"}`, "a@b.co"},
+		{"trailing whitespace", "{\"email\":\"a@b.co\"}\n\t ", "a@b.co"},
+		{"empty body", ``, ""},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", "application/json")
+
+			got, err := decodeRequest[req](r, true)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Email != tc.want {
+				t.Fatalf("decoded = %+v, want email %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeRequestLenient pins the default mode, which strict decoding must
+// leave unchanged: unknown fields and trailing data are tolerated, and a
+// malformed body keeps its parser detail.
+func TestDecodeRequestLenient(t *testing.T) {
+	t.Parallel()
+	type req struct {
+		Email string `json:"email"`
+	}
+
+	t.Run("unknown field and trailing data are accepted", func(t *testing.T) {
+		t.Parallel()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x",
+			strings.NewReader(`{"email":"a@b.co","x":1} garbage`))
+		r.Header.Set("Content-Type", "application/json")
+
+		got, err := decodeRequest[req](r, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Email != "a@b.co" {
+			t.Fatalf("decoded = %+v", got)
+		}
+	})
+
+	t.Run("malformed body keeps the parser detail", func(t *testing.T) {
+		t.Parallel()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(`{"email":`))
+		r.Header.Set("Content-Type", "application/json")
+
+		_, err := decodeRequest[req](r, false)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest {
+			t.Fatalf("error = %v, want 400 *APIError", err)
+		}
+		if !strings.HasPrefix(apiErr.Message, "malformed JSON body: ") {
+			t.Fatalf("message = %q, want the parser detail", apiErr.Message)
+		}
+	})
+}
+
+// TestDecodeRequestContentTypeCase proves the JSON media type matches
+// case-insensitively (RFC 9110) in both modes, while other types still skip
+// the body.
+func TestDecodeRequestContentTypeCase(t *testing.T) {
+	t.Parallel()
+	type req struct {
+		Email string `json:"email"`
+	}
+
+	for _, strict := range []bool{false, true} {
+		for _, tc := range []struct {
+			contentType string
+			want        string
+		}{
+			{"application/json", "a@b.co"},
+			{"Application/JSON", "a@b.co"},
+			{"APPLICATION/JSON; charset=utf-8", "a@b.co"},
+			{"text/plain", ""},
+		} {
+			t.Run(fmt.Sprintf("strict=%t/%s", strict, tc.contentType), func(t *testing.T) {
+				t.Parallel()
+				r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x",
+					strings.NewReader(`{"email":"a@b.co"}`))
+				r.Header.Set("Content-Type", tc.contentType)
+
+				got, err := decodeRequest[req](r, strict)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got.Email != tc.want {
+					t.Fatalf("decoded = %+v, want email %q", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
 // FuzzDecodeRequest proves decodeRequest never panics on arbitrary body bytes
-// for a representative request type.
+// for a representative request type, in either decoding mode.
 func FuzzDecodeRequest(f *testing.F) {
 	for _, seed := range [][]byte{
 		[]byte(`{}`),
@@ -326,10 +470,12 @@ func FuzzDecodeRequest(f *testing.F) {
 		Email string `json:"email"`
 	}
 	f.Fuzz(func(t *testing.T, body []byte) {
-		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/leads",
-			bytes.NewReader(body))
-		r.Header.Set("Content-Type", "application/json")
-		_, _ = decodeRequest[req](r) // contract: must not panic
+		for _, strict := range []bool{false, true} {
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/leads",
+				bytes.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+			_, _ = decodeRequest[req](r, strict) // contract: must not panic
+		}
 	})
 }
 
@@ -346,7 +492,7 @@ func BenchmarkDecodeRequest(b *testing.B) {
 		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 			"/leads", bytes.NewReader(body))
 		r.Header.Set("Content-Type", "application/json")
-		if _, err := decodeRequest[req](r); err != nil {
+		if _, err := decodeRequest[req](r, false); err != nil {
 			b.Fatal(err)
 		}
 	}
