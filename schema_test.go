@@ -901,3 +901,78 @@ func TestResponseSchemaUnwrapsPointerEnvelopes(t *testing.T) {
 	require.True(t, hasBody)
 	assert.Equal(t, map[string]any{"$ref": componentRef + "SharedSame"}, schema)
 }
+
+// DateView is a response whose date-only field the encoder always writes, so
+// the field is required and nullable.
+type DateView struct {
+	Born *string `json:"born" validate:"date"`
+}
+
+func TestSchemaDateFormat(t *testing.T) {
+	t.Parallel()
+	const dateString = `{"format":"date","type":"string"}`
+
+	type req struct {
+		On  string `json:"on" validate:"date"`
+		Due string `json:"due" validate:"required,date"`
+	}
+
+	t.Run("a request body field is a string with format date", func(t *testing.T) {
+		t.Parallel()
+		body := requestBodyOf(t, contractFor[req, struct{}](t))
+		assert.JSONEq(t, dateString, jsonOf(t, propertyOf(t, body, "on")))
+		assert.JSONEq(t, dateString, jsonOf(t, propertyOf(t, body, "due")))
+		assert.Equal(t, []string{"due"}, requiredOf(body))
+	})
+
+	t.Run("a response pointer is also nullable", func(t *testing.T) {
+		t.Parallel()
+		view := component(t, contractFor[struct{}, DateView](t), "DateView")
+		assert.JSONEq(t, `{"format":"date","type":["string","null"]}`, jsonOf(t, propertyOf(t, view, "born")))
+	})
+
+	t.Run("OpenAPI 3.0 documents it too", func(t *testing.T) {
+		t.Parallel()
+		doc := contractFor[req, DateView](t, WithOpenAPIVersion("3.0.3"))
+		assert.JSONEq(t, dateString, jsonOf(t, propertyOf(t, requestBodyOf(t, doc), "on")))
+		assert.JSONEq(t, `{"format":"date","nullable":true,"type":"string"}`,
+			jsonOf(t, propertyOf(t, component(t, doc, "DateView"), "born")))
+	})
+
+	t.Run("path, query, and header parameters", func(t *testing.T) {
+		t.Parallel()
+		type params struct {
+			On    string `json:"-" path:"on" validate:"date"`
+			Since string `json:"-" query:"since" validate:"date"`
+			AsOf  string `json:"-" header:"X-As-Of" validate:"date"`
+		}
+		assert.JSONEq(t, `[
+			{"name":"on","in":"path","required":true,"schema":{"type":"string","format":"date"}},
+			{"name":"since","in":"query","required":false,"schema":{"type":"string","format":"date"}},
+			{"name":"X-As-Of","in":"header","required":false,"schema":{"type":"string","format":"date"}}
+		]`, jsonOf(t, buildParameters(newSchemaBuilder(), reflect.TypeFor[params]())))
+	})
+
+	t.Run("other shapes and unknown rules are not documented", func(t *testing.T) {
+		t.Parallel()
+		type other struct {
+			Count int    `json:"count" validate:"date"`
+			Stamp string `json:"stamp" validate:"datetime"`
+		}
+		body := requestBodyOf(t, contractFor[other, struct{}](t))
+		assert.JSONEq(t, `{"type":"integer"}`, jsonOf(t, propertyOf(t, body, "count")))
+		assert.JSONEq(t, `{"type":"string"}`, jsonOf(t, propertyOf(t, body, "stamp")))
+	})
+
+	t.Run("a date field is never a pattern or a date-time", func(t *testing.T) {
+		t.Parallel()
+		for _, doc := range []map[string]any{
+			contractFor[req, DateView](t),
+			contractFor[req, DateView](t, WithOpenAPIVersion("3.0.3")),
+		} {
+			rendered := jsonOf(t, doc)
+			assert.NotContains(t, rendered, "pattern")
+			assert.NotContains(t, rendered, "date-time")
+		}
+	})
+}

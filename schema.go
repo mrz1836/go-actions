@@ -410,7 +410,7 @@ func applyConstraints(schema map[string]any, rules []rule) {
 			if shapeType(r.shape) == typ {
 				schema["enum"] = slices.Clone(r.enum)
 			}
-		case ruleUUID, ruleEmail, ruleRFC3339, ruleE164:
+		case ruleUUID, ruleEmail, ruleRFC3339, ruleE164, ruleDate:
 			if typ == typeString {
 				applyFormat(schema, r.kind)
 			}
@@ -476,6 +476,8 @@ func applyFormat(schema map[string]any, kind ruleKind) {
 		schema["format"] = "email"
 	case ruleRFC3339:
 		schema["format"] = "date-time"
+	case ruleDate:
+		schema["format"] = "date"
 	default:
 		schema["pattern"] = e164Pattern
 	}
