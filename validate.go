@@ -44,6 +44,7 @@ const (
 	ruleEmail
 	ruleE164
 	ruleRFC3339
+	ruleDate
 )
 
 // valueShape classifies a field's type (pointers followed) for the rules that
@@ -107,6 +108,7 @@ var formatMessages = map[ruleKind]string{
 	ruleEmail:   "must be a valid email address",
 	ruleE164:    "must be a valid E.164 phone number",
 	ruleRFC3339: "must be an RFC 3339 timestamp",
+	ruleDate:    "must be a calendar date (YYYY-MM-DD)",
 }
 
 // parseRules parses a validate tag for a field of type t. A rule that does not
@@ -150,6 +152,8 @@ func parseRule(key, arg string, shape valueShape) (rule, bool) {
 		kind = ruleE164
 	case "rfc3339":
 		kind = ruleRFC3339
+	case "date":
+		kind = ruleDate
 	default:
 		return rule{}, false
 	}
@@ -248,6 +252,8 @@ func (r *rule) fails(v reflect.Value) bool {
 		return err != nil
 	case ruleE164:
 		return !isE164(v.String())
+	case ruleDate:
+		return !isDate(v.String())
 	default:
 		_, err := time.Parse(time.RFC3339, v.String())
 		return err != nil
@@ -301,6 +307,14 @@ func isE164(s string) bool {
 		}
 	}
 	return true
+}
+
+// isDate reports whether s is a calendar date written YYYY-MM-DD. The parser
+// rejects impossible dates such as 2026-02-30, and the round trip rejects
+// anything that doesn't format back to itself, such as 2026-1-1.
+func isDate(s string) bool {
+	t, err := time.Parse(time.DateOnly, s)
+	return err == nil && t.Format(time.DateOnly) == s
 }
 
 // isEmptyValue reports whether fv is empty for the required rule and the

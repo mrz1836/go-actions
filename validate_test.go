@@ -309,15 +309,15 @@ func TestValidateRequest(t *testing.T) {
 }
 
 // FuzzValidateRequest proves validateRequest never panics across the full rule
-// vocabulary (required/min/max/oneof/uuid/email/e164/rfc3339) — on top-level,
+// vocabulary (required/min/max/oneof/uuid/email/e164/rfc3339/date) — on top-level,
 // pointer, and nested (struct, slice, and map) fields — when fed arbitrary
 // values, and that every failure names its field.
 func FuzzValidateRequest(f *testing.F) {
-	f.Add("jane@example.com", "+13055551234", "01900000-0000-7000-8000-000000000001", "2026-05-20T00:00:00Z", "b", 50, "line", 2, true)
-	f.Add("", "", "", "", "", 0, "", 0, false)
-	f.Add("not-an-email", "12345", "not-a-uuid", "yesterday", "z", -1, "much-too-long", 0, true)
-	f.Add("\x00", "\x00", "\x00", "\x00", "\x00", 1<<31, "\xff", -7, true)
-	f.Fuzz(func(t *testing.T, email, phone, id, when, kind string, n int, name string, qty int, withPtr bool) {
+	f.Add("jane@example.com", "+13055551234", "01900000-0000-7000-8000-000000000001", "2026-05-20T00:00:00Z", "2024-02-29", "b", 50, "line", 2, true)
+	f.Add("", "", "", "", "", "", 0, "", 0, false)
+	f.Add("not-an-email", "12345", "not-a-uuid", "yesterday", "2026-02-30", "z", -1, "much-too-long", 0, true)
+	f.Add("\x00", "\x00", "\x00", "\x00", "\x00", "\x00", 1<<31, "\xff", -7, true)
+	f.Fuzz(func(t *testing.T, email, phone, id, when, born, kind string, n int, name string, qty int, withPtr bool) {
 		type line struct {
 			Name string `json:"name" validate:"required,max=8"`
 			Qty  *int   `json:"qty" validate:"min=1,oneof=1 2 3"`
@@ -327,6 +327,7 @@ func FuzzValidateRequest(f *testing.F) {
 			Phone string           `json:"phone" validate:"e164"`
 			ID    string           `json:"id" validate:"uuid"`
 			When  string           `json:"when" validate:"rfc3339"`
+			Born  string           `json:"born" validate:"date"`
 			Kind  string           `json:"kind" validate:"required,oneof=a b c"`
 			Limit int              `json:"limit" validate:"min=1,max=100"`
 			Lines []line           `json:"lines" validate:"max=1"`
@@ -338,7 +339,7 @@ func FuzzValidateRequest(f *testing.F) {
 			l.Qty = &qty
 		}
 		v := req{
-			Email: email, Phone: phone, ID: id, When: when, Kind: kind, Limit: n,
+			Email: email, Phone: phone, ID: id, When: when, Born: born, Kind: kind, Limit: n,
 			Lines: []line{l, l}, ByKey: map[string]*line{name: &l, "nil": nil},
 		}
 		if withPtr {
@@ -363,6 +364,7 @@ func BenchmarkValidateRequest(b *testing.B) {
 		Phone string `json:"phone" validate:"e164"`
 		ID    string `json:"id" validate:"uuid"`
 		When  string `json:"when" validate:"rfc3339"`
+		Born  string `json:"born" validate:"date"`
 		Kind  string `json:"kind" validate:"oneof=a b c"`
 		Limit int    `json:"limit" validate:"min=1,max=100"`
 	}
@@ -371,6 +373,7 @@ func BenchmarkValidateRequest(b *testing.B) {
 		Phone: "+13055551234",
 		ID:    "01900000-0000-7000-8000-000000000001",
 		When:  "2026-05-20T00:00:00Z",
+		Born:  "2026-05-20",
 		Kind:  "b",
 		Limit: 50,
 	}
@@ -647,6 +650,84 @@ func TestValidateFormatRulesApplyOnlyToStrings(t *testing.T) {
 		"a time.Time with rfc3339 no longer always fails; only the string-kinded field is format-checked")
 }
 
+func TestValidateDateRule(t *testing.T) {
+	type req struct {
+		Born string `json:"born" validate:"date"`
+	}
+
+	t.Run("calendar dates pass", func(t *testing.T) {
+		// The rule checks form and calendar only; ranges are the caller's.
+		for _, v := range []string{"2024-02-29", "2026-01-31", "1900-01-01", "0000-01-01", "9999-12-31"} {
+			assert.Nil(t, fieldErrors(t, req{Born: v}), v)
+		}
+	})
+
+	t.Run("anything else fails without repeating the value", func(t *testing.T) {
+		for _, v := range []string{
+			"2026-02-30",
+			"2023-02-29",
+			"2026-13-01",
+			"2026-00-10",
+			"2026-01-00",
+			"2026-01-32",
+			"2026-1-1",
+			"26-01-01",
+			"20260101",
+			"2026/01/01",
+			"2026-01-01T00:00:00Z",
+			"2026-01-01 00:00:00",
+			" 2026-01-01",
+			"2026-01-01 ",
+			"2026-01-01\n",
+			"+2026-01-01",
+			"\uff12\uff10\uff12\uff16-01-01", // fullwidth digits
+			"yesterday",
+		} {
+			errs := fieldErrors(t, req{Born: v})
+			assert.Equal(t, []string{"born: must be a calendar date (YYYY-MM-DD)"}, errs, "%q", v)
+			for _, e := range errs {
+				assert.NotContains(t, e, v, "a message never repeats the value")
+			}
+		}
+	})
+
+	t.Run("presence follows the usual rules", func(t *testing.T) {
+		type required struct {
+			Born string `json:"born" validate:"required,date"`
+		}
+		type optional struct {
+			Born *string `json:"born" validate:"date"`
+		}
+		empty := ""
+		assert.Nil(t, fieldErrors(t, req{}), "a non-pointer zero value is skipped")
+		assert.Equal(t, []string{"born: is required"}, fieldErrors(t, required{}))
+		assert.Equal(t, []string{"born: must be a calendar date (YYYY-MM-DD)"}, fieldErrors(t, optional{Born: &empty}),
+			"a non-nil pointer is checked even when it holds the empty string")
+		assert.Nil(t, fieldErrors(t, optional{}), "a nil pointer is absent")
+	})
+}
+
+func TestValidateDateRuleLeavesOtherRulesUnchanged(t *testing.T) {
+	type req struct {
+		DateTime string `json:"datetime" validate:"datetime"`
+		Date2    string `json:"date2" validate:"date2"`
+		ISO      string `json:"iso" validate:"iso8601"`
+		Count    int    `json:"count" validate:"date"`
+	}
+	assert.Nil(t, fieldErrors(t, req{DateTime: "nonsense", Date2: "nonsense", ISO: "nonsense", Count: 7}),
+		"unknown rules stay dropped, and date on an int is not enforced")
+
+	type stamps struct {
+		When string `json:"when" validate:"rfc3339"`
+		On   string `json:"on" validate:"date"`
+	}
+	assert.Equal(t, []string{"when: must be an RFC 3339 timestamp"}, fieldErrors(t, stamps{When: "2026-01-01", On: "2026-01-01"}),
+		"rfc3339 still rejects a bare date")
+	assert.Equal(t, []string{"on: must be a calendar date (YYYY-MM-DD)"},
+		fieldErrors(t, stamps{When: "2026-01-01T00:00:00Z", On: "2026-01-01T00:00:00Z"}),
+		"rfc3339 accepts a timestamp, which date refuses")
+}
+
 func TestValidateStringLengthCountsRunes(t *testing.T) {
 	type req struct {
 		Name string `json:"name" validate:"min=2,max=5"`
@@ -759,8 +840,12 @@ func TestParseRules(t *testing.T) {
 		{name: "negative length bound", tag: "min=-1", typ: sliceType},
 		{name: "negative number bound", tag: "min=-1", typ: intType, kinds: []ruleKind{ruleMin}},
 		{name: "bound on a bool", tag: "min=1", typ: reflect.TypeFor[bool](), kinds: nil},
-		{name: "format on a slice", tag: "uuid,email,e164,rfc3339", typ: sliceType},
-		{name: "formats on a string", tag: "uuid,email,e164,rfc3339", typ: strType, kinds: []ruleKind{ruleUUID, ruleEmail, ruleE164, ruleRFC3339}},
+		{name: "format on a slice", tag: "uuid,email,e164,rfc3339,date", typ: sliceType},
+		{name: "formats on a string", tag: "uuid,email,e164,rfc3339,date", typ: strType, kinds: []ruleKind{ruleUUID, ruleEmail, ruleE164, ruleRFC3339, ruleDate}},
+		{name: "date on a string", tag: "date", typ: strType, kinds: []ruleKind{ruleDate}},
+		{name: "date on a string pointer", tag: "date", typ: reflect.TypeFor[*string](), kinds: []ruleKind{ruleDate}},
+		{name: "date on an int", tag: "date", typ: intType},
+		{name: "date on a time.Time", tag: "date", typ: reflect.TypeFor[time.Time]()},
 		{name: "infinite float oneof", tag: "oneof=1 Inf", typ: reflect.TypeFor[float64]()},
 		{name: "negative uint oneof", tag: "oneof=-1", typ: reflect.TypeFor[uint]()},
 	}

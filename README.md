@@ -133,7 +133,7 @@ The highlights:
 - **Documented auth**: declare OpenAPI `securitySchemes` and per-operation `security` (with `BearerAuth`/`APIKeyAuth` helpers) so the contract states how to authenticate.
 - **Pluggable error mapping**: decouple your domain errors from the wire shape with an `ErrorMapper`.
 - **Self-documenting**: serve `/openapi.json`, `/openapi.yaml`, and a browsable `/_actions` index straight from the registry.
-- **Struct-tag validation, with an escape hatch**: `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, and `rfc3339`, enforced on nested structs, slices, and maps too, and the same parsed rules become the schema's constraints. A `Validatable` interface covers rules a tag can't express.
+- **Struct-tag validation, with an escape hatch**: `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, `rfc3339`, and `date`, enforced on nested structs, slices, and maps too, and the same parsed rules become the schema's constraints. A `Validatable` interface covers rules a tag can't express.
 - **No domain coupling**: the core imports only the standard library, `go-chi/chi/v5`, `google/uuid`, and `gopkg.in/yaml.v3`.
 
 > Why it matters: in 2026, your API contract is consumed by SDK generators, API
@@ -776,6 +776,7 @@ constraints. One parser reads the rules for both sides:
 | `email` | strings | `net/mail.ParseAddress` accepts it (display names too: `Jane <jane@example.com>`) | `format: email` |
 | `e164` | strings | `+`, a non-zero digit, then 1–14 digits | `pattern: ^\+[1-9]\d{1,14}$` |
 | `rfc3339` | strings | `time.Parse(time.RFC3339, …)` accepts it | `format: date-time` |
+| `date` | strings | a calendar date written `YYYY-MM-DD`: `time.Parse(time.DateOnly, …)` accepts it (so `2026-02-30` fails) and formatting the result gives the input back; a timestamp fails | `format: date` |
 
 - **Ignored rules.** A rule on a type it does not apply to (`email` on an `int`, `min` on a
   `bool`) is ignored on both sides: neither enforced nor documented. So is a malformed rule
@@ -798,6 +799,10 @@ constraints. One parser reads the rules for both sides:
 - **Field names.** A failure is named after the parameter tag (`limit`, `X-Trace-Id`), else
   the JSON name, else the Go field name. Unexported fields are never bound, so their tags
   are ignored.
+
+A `time.Time` field is documented as `format: date-time`. For a date without a time, use a
+`string` field with `date`; check its range (for example, not in the future) in
+`Validatable`.
 
 For rules a tag can't express, implement `Validatable` (`Validate() error`, on the value
 or pointer receiver) on the top-level request type. It is **always** called, even when
@@ -1113,7 +1118,7 @@ Medians of `go test -run '^$' -bench . -benchmem -count 6`, measured with Go 1.2
 | `Handler/with_observer` | `create_201` with a `WithObserver` hook | 3,964 | 8,723 | 53 |
 | `DecodeRequest` | decoding a small JSON body (request construction included) | 1,640 | 6,022 | 18 |
 | `DecodeRequest_Params` | binding five path, query, and header parameters | 433 | 513 | 7 |
-| `ValidateRequest` | six fields covering the whole rule vocabulary | 329 | 88 | 5 |
+| `ValidateRequest` | seven fields covering the whole rule vocabulary | 485 | 104 | 6 |
 | `ValidateRequest_Nested` | a slice of ten structs with rules | 644 | 320 | 1 |
 | `EncodeResponse/created` | encoding a `Created[T]` body | 588 | 1,080 | 12 |
 | `WriteAPIError` | writing a `422` with two field details | 837 | 1,545 | 16 |

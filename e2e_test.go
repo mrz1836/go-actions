@@ -317,6 +317,93 @@ func TestE2E_StrictDecoding(t *testing.T) {
 	})
 }
 
+// birthdayReq carries a date-only field, enforced and documented by the date
+// rule.
+type birthdayReq struct {
+	BirthDate string `json:"birth_date" validate:"required,date"`
+}
+
+// birthdayAction accepts a calendar date and echoes it back.
+func birthdayAction() actions.Action[birthdayReq, pingResp] {
+	return actions.Action[birthdayReq, pingResp]{
+		ID:       "test.birthday",
+		Method:   http.MethodPost,
+		Path:     "/birthdays",
+		Summary:  "Record a birthday",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK, Description: "ok"}},
+		Handle: func(_ context.Context, req birthdayReq) (pingResp, error) {
+			return pingResp{Greeting: "born " + req.BirthDate}, nil
+		},
+	}
+}
+
+// findProperty returns the first schema named name under any "properties"
+// object in v, a decoded JSON document, or nil.
+func findProperty(v any, name string) map[string]any {
+	switch node := v.(type) {
+	case map[string]any:
+		if props, ok := node["properties"].(map[string]any); ok {
+			if prop, ok := props[name].(map[string]any); ok {
+				return prop
+			}
+		}
+		for _, child := range node {
+			if prop := findProperty(child, name); prop != nil {
+				return prop
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if prop := findProperty(child, name); prop != nil {
+				return prop
+			}
+		}
+	}
+	return nil
+}
+
+// TestE2E_DateRule drives a date-only field through a served registry: a real
+// calendar date is accepted, an impossible date and a timestamp are a 422 whose
+// body never repeats the value, and the served contract documents the field as
+// format: date.
+func TestE2E_DateRule(t *testing.T) {
+	t.Parallel()
+	reg := actions.NewRegistry()
+	actions.Register(reg, birthdayAction())
+	base := actiontest.NewServer(t, reg).URL
+
+	t.Run("a calendar date is accepted", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodPost, base+"/birthdays", `{"birth_date":"2024-02-29"}`)
+		assert.Equal(t, http.StatusOK, status, body)
+	})
+
+	for _, value := range []string{"2026-02-30", "2026-01-01T00:00:00Z"} {
+		t.Run(value+" is refused", func(t *testing.T) {
+			t.Parallel()
+			status, _, body := doReq(t, http.MethodPost, base+"/birthdays", `{"birth_date":"`+value+`"}`)
+			assert.Equal(t, http.StatusUnprocessableEntity, status)
+			var got map[string]any
+			require.NoError(t, json.Unmarshal([]byte(body), &got))
+			assert.Equal(t, "validation failed: birth_date: must be a calendar date (YYYY-MM-DD)", got["error"])
+			assert.Equal(t, actions.CodeValidation, got["code"])
+			assert.NotContains(t, body, value, "the response never repeats the value")
+		})
+	}
+
+	t.Run("the contract documents format: date", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/openapi.json", "")
+		require.Equal(t, http.StatusOK, status)
+		var doc map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &doc))
+		birthDate := findProperty(doc, "birth_date")
+		require.NotNil(t, birthDate, "birth_date must be documented")
+		assert.Equal(t, "string", birthDate["type"])
+		assert.Equal(t, "date", birthDate["format"])
+	})
+}
+
 // Request and response types for BenchmarkHandler.
 type (
 	benchCreateReq struct {
