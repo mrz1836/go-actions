@@ -227,6 +227,45 @@ func TestOpenAPI_ResponseHeaders(t *testing.T) {
 	assert.False(t, hasHeaders)
 }
 
+// filterReq is a list filter: two repeated query parameters and a scalar one.
+type filterReq struct {
+	States []string `json:"-" query:"state"`
+	Limits []int    `json:"-" query:"limit" validate:"required,max=3"`
+	Cursor string   `json:"-" query:"cursor"`
+}
+
+func TestOpenAPISliceQueryParameterIsFormExploded(t *testing.T) {
+	t.Parallel()
+	for _, version := range []string{"3.1.0", "3.0.3"} {
+		t.Run(version, func(t *testing.T) {
+			t.Parallel()
+			reg := actions.NewRegistry(actions.WithOpenAPIVersion(version))
+			actions.Register(reg, actions.Action[filterReq, pingResp]{
+				ID: "test.filter", Method: http.MethodGet, Path: "/filter", Summary: "Filter",
+				Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+				Handle:   okHandle[filterReq, pingResp],
+			})
+			reg.Freeze()
+
+			var doc map[string]any
+			require.NoError(t, json.Unmarshal(reg.OpenAPIJSON(), &doc))
+			paths, _ := doc["paths"].(map[string]any)
+			pathItem, _ := paths["/filter"].(map[string]any)
+			get, _ := pathItem["get"].(map[string]any)
+			params, _ := get["parameters"].([]any)
+			rendered, err := json.Marshal(params)
+			require.NoError(t, err)
+			assert.JSONEq(t, `[
+				{"name":"state","in":"query","required":false,"style":"form","explode":true,
+				 "schema":{"type":"array","items":{"type":"string"}}},
+				{"name":"limit","in":"query","required":true,"style":"form","explode":true,
+				 "schema":{"type":"array","items":{"type":"integer"},"maxItems":3}},
+				{"name":"cursor","in":"query","required":false,"schema":{"type":"string"}}
+			]`, string(rendered), "a scalar parameter stays as it was")
+		})
+	}
+}
+
 // errorComponent returns the Error component schema of a frozen registry.
 func errorComponent(t *testing.T, reg *actions.Registry) map[string]any {
 	t.Helper()

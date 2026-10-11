@@ -264,14 +264,15 @@ func TestValidateRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("format rule on a non-string field is ignored", func(t *testing.T) {
+	t.Run("format rule on a non-string field is refused", func(t *testing.T) {
 		t.Parallel()
-		// Format rules apply only to string kinds, at runtime and in the schema.
+		// Format rules apply only to string kinds, so Freeze refuses one on an int.
 		type req struct {
 			Code int `json:"code" validate:"uuid"`
 		}
-		if err := validateRequest(req{Code: 7}); err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		want := `actions: action "x.list": field "code": validate rule "uuid" does not apply to int`
+		if got := freezeRefusal[req, Empty](t); got != want {
+			t.Fatalf("Freeze = %q, want %q", got, want)
 		}
 	})
 
@@ -619,12 +620,9 @@ func TestValidateOneOfTyped(t *testing.T) {
 		Big   int64   `json:"big" validate:"oneof=9007199254740993"`
 		Uint  uint8   `json:"uint" validate:"oneof=4 5"`
 		Float float64 `json:"float" validate:"oneof=0.5 1.5"`
-		Bad   int     `json:"bad" validate:"oneof=1 two"`
-		Empty string  `json:"empty" validate:"oneof="`
-		Flag  bool    `json:"flag" validate:"oneof=true"`
 	}
-	valid := req{Str: "red", Int: 2, Big: 9007199254740993, Uint: 5, Float: 1.5, Bad: 7, Empty: "x", Flag: true}
-	assert.Nil(t, fieldErrors(t, valid), "values compare as their own type; malformed oneofs are ignored")
+	valid := req{Str: "red", Int: 2, Big: 9007199254740993, Uint: 5, Float: 1.5}
+	assert.Nil(t, fieldErrors(t, valid), "values compare as their own type")
 
 	invalid := req{Str: "blue", Int: 4, Big: 9007199254740992, Uint: 6, Float: 2.5}
 	assert.Equal(t, []string{
@@ -634,20 +632,57 @@ func TestValidateOneOfTyped(t *testing.T) {
 		"uint: must be one of: 4, 5",
 		"float: must be one of: 0.5, 1.5",
 	}, fieldErrors(t, invalid))
+
+	type (
+		bad struct {
+			Bad int `json:"bad" validate:"oneof=1 two"`
+		}
+		empty struct {
+			Empty string `json:"empty" validate:"oneof="`
+		}
+		flag struct {
+			Flag bool `json:"flag" validate:"oneof=true"`
+		}
+	)
+	assert.Equal(t, `actions: action "x.list": field "bad": validate rule "oneof" has an invalid argument`,
+		freezeRefusal[bad, Empty](t), "a value that is not the field's type")
+	assert.Equal(t, `actions: action "x.list": field "empty": validate rule "oneof" has an invalid argument`,
+		freezeRefusal[empty, Empty](t), "no values")
+	assert.Equal(t, `actions: action "x.list": field "flag": validate rule "oneof" does not apply to bool`,
+		freezeRefusal[flag, Empty](t), "a bool")
 }
 
 func TestValidateFormatRulesApplyOnlyToStrings(t *testing.T) {
 	type named string
 	type req struct {
-		When  time.Time `json:"when" validate:"required,rfc3339"`
-		ID    uuid.UUID `json:"id" validate:"uuid"`
-		Code  int       `json:"code" validate:"email"`
-		Items []string  `json:"items" validate:"e164"`
-		Kind  named     `json:"kind" validate:"uuid"`
+		Kind named `json:"kind" validate:"uuid"`
 	}
-	in := req{When: time.Now(), ID: uuid.New(), Code: 7, Items: []string{"x"}, Kind: "nope"}
+	in := req{Kind: "nope"}
 	assert.Equal(t, []string{"kind: must be a valid UUID"}, fieldErrors(t, in),
-		"a time.Time with rfc3339 no longer always fails; only the string-kinded field is format-checked")
+		"a named string type is format-checked")
+
+	type (
+		when struct {
+			When time.Time `json:"when" validate:"required,rfc3339"`
+		}
+		id struct {
+			ID uuid.UUID `json:"id" validate:"uuid"`
+		}
+		code struct {
+			Code int `json:"code" validate:"email"`
+		}
+		items struct {
+			Items []string `json:"items" validate:"e164"`
+		}
+	)
+	assert.Equal(t, `actions: action "x.list": field "when": validate rule "rfc3339" does not apply to time.Time`,
+		freezeRefusal[when, Empty](t))
+	assert.Equal(t, `actions: action "x.list": field "id": validate rule "uuid" does not apply to uuid.UUID`,
+		freezeRefusal[id, Empty](t))
+	assert.Equal(t, `actions: action "x.list": field "code": validate rule "email" does not apply to int`,
+		freezeRefusal[code, Empty](t))
+	assert.Equal(t, `actions: action "x.list": field "items": validate rule "e164" does not apply to []string`,
+		freezeRefusal[items, Empty](t))
 }
 
 func TestValidateDateRule(t *testing.T) {
@@ -708,14 +743,28 @@ func TestValidateDateRule(t *testing.T) {
 }
 
 func TestValidateDateRuleLeavesOtherRulesUnchanged(t *testing.T) {
-	type req struct {
-		DateTime string `json:"datetime" validate:"datetime"`
-		Date2    string `json:"date2" validate:"date2"`
-		ISO      string `json:"iso" validate:"iso8601"`
-		Count    int    `json:"count" validate:"date"`
-	}
-	assert.Nil(t, fieldErrors(t, req{DateTime: "nonsense", Date2: "nonsense", ISO: "nonsense", Count: 7}),
-		"unknown rules stay dropped, and date on an int is not enforced")
+	type (
+		dateTime struct {
+			DateTime string `json:"datetime" validate:"datetime"`
+		}
+		date2 struct {
+			Date2 string `json:"date2" validate:"date2"`
+		}
+		iso struct {
+			ISO string `json:"iso" validate:"iso8601"`
+		}
+		count struct {
+			Count int `json:"count" validate:"date"`
+		}
+	)
+	assert.Equal(t, `actions: action "x.list": field "datetime": unknown validate rule "datetime"`,
+		freezeRefusal[dateTime, Empty](t))
+	assert.Equal(t, `actions: action "x.list": field "date2": unknown validate rule "date2"`,
+		freezeRefusal[date2, Empty](t))
+	assert.Equal(t, `actions: action "x.list": field "iso": unknown validate rule "iso8601"`,
+		freezeRefusal[iso, Empty](t))
+	assert.Equal(t, `actions: action "x.list": field "count": validate rule "date" does not apply to int`,
+		freezeRefusal[count, Empty](t))
 
 	type stamps struct {
 		When string `json:"when" validate:"rfc3339"`
@@ -829,38 +878,46 @@ func TestParseRules(t *testing.T) {
 		tag   string
 		typ   reflect.Type
 		kinds []ruleKind
+		err   string
 	}{
 		{name: "empty tag", tag: "", typ: strType},
 		{name: "blank segments and spaces", tag: " required ,, max=3 ", typ: strType, kinds: []ruleKind{ruleRequired, ruleMax}},
-		{name: "unknown rule", tag: "dive,required", typ: strType, kinds: []ruleKind{ruleRequired}},
-		{name: "non-numeric bound", tag: "min=abc", typ: intType},
-		{name: "NaN and Inf bounds", tag: "min=NaN,max=Inf", typ: intType},
+		{name: "unknown rule", tag: "dive,required", typ: strType, kinds: []ruleKind{ruleRequired}, err: `unknown validate rule "dive"`},
+		{name: "non-numeric bound", tag: "min=abc", typ: intType, err: `validate rule "min" has an invalid argument`},
+		{name: "NaN and Inf bounds", tag: "min=NaN,max=Inf", typ: intType, err: `validate rule "min" has an invalid argument`},
 		{name: "fractional number bound", tag: "min=0.5", typ: intType, kinds: []ruleKind{ruleMin}},
-		{name: "fractional length bound", tag: "min=1.5", typ: strType},
-		{name: "negative length bound", tag: "min=-1", typ: sliceType},
+		{name: "fractional length bound", tag: "min=1.5", typ: strType, err: `validate rule "min" has an invalid argument`},
+		{name: "negative length bound", tag: "min=-1", typ: sliceType, err: `validate rule "min" has an invalid argument`},
 		{name: "negative number bound", tag: "min=-1", typ: intType, kinds: []ruleKind{ruleMin}},
-		{name: "bound on a bool", tag: "min=1", typ: reflect.TypeFor[bool](), kinds: nil},
-		{name: "format on a slice", tag: "uuid,email,e164,rfc3339,date", typ: sliceType},
+		{name: "bound on a bool", tag: "min=1", typ: reflect.TypeFor[bool](), kinds: nil, err: `validate rule "min" does not apply to bool`},
+		{name: "format on a slice", tag: "uuid,email,e164,rfc3339,date", typ: sliceType, err: `validate rule "uuid" does not apply to []int`},
 		{name: "formats on a string", tag: "uuid,email,e164,rfc3339,date", typ: strType, kinds: []ruleKind{ruleUUID, ruleEmail, ruleE164, ruleRFC3339, ruleDate}},
 		{name: "date on a string", tag: "date", typ: strType, kinds: []ruleKind{ruleDate}},
 		{name: "date on a string pointer", tag: "date", typ: reflect.TypeFor[*string](), kinds: []ruleKind{ruleDate}},
-		{name: "date on an int", tag: "date", typ: intType},
-		{name: "date on a time.Time", tag: "date", typ: reflect.TypeFor[time.Time]()},
-		{name: "infinite float oneof", tag: "oneof=1 Inf", typ: reflect.TypeFor[float64]()},
-		{name: "negative uint oneof", tag: "oneof=-1", typ: reflect.TypeFor[uint]()},
+		{name: "date on an int", tag: "date", typ: intType, err: `validate rule "date" does not apply to int`},
+		{name: "date on a time.Time", tag: "date", typ: reflect.TypeFor[time.Time](), err: `validate rule "date" does not apply to time.Time`},
+		{name: "infinite float oneof", tag: "oneof=1 Inf", typ: reflect.TypeFor[float64](), err: `validate rule "oneof" has an invalid argument`},
+		{name: "negative uint oneof", tag: "oneof=-1", typ: reflect.TypeFor[uint](), err: `validate rule "oneof" has an invalid argument`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			rules, err := parseRules(tc.tag, tc.typ)
 			var kinds []ruleKind
-			for _, r := range parseRules(tc.tag, tc.typ) {
+			for _, r := range rules {
 				kinds = append(kinds, r.kind)
 			}
 			assert.Equal(t, tc.kinds, kinds)
+			if tc.err == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.err)
+			}
 		})
 	}
 
 	t.Run("bounds render canonically in messages", func(t *testing.T) {
-		rules := parseRules("min=1e1,max=2.50", intType)
+		rules, err := parseRules("min=1e1,max=2.50", intType)
+		require.NoError(t, err)
 		require.Len(t, rules, 2)
 		assert.Equal(t, "must be at least 10", rules[0].msg)
 		assert.Equal(t, "must be at most 2.5", rules[1].msg)
