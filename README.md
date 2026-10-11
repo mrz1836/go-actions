@@ -393,14 +393,18 @@ a slice type with one (`net.IP`): it takes one value, like any scalar.
 | `actions.Empty` | `204` | none | `204` |
 | `actions.Created[T]` | `201` | `T` | `201` |
 | `actions.Accepted[T]` | `202` | `T` | `202` |
-| `actions.Response[T]` | its `Status` (`200` when zero) | `T` (none when `Status` is `204`), plus its `Header` | every status the handler can pick; `Freeze` cannot check these |
+| `actions.Response[T]` | its `Status` (`200` when zero) | `T` (none when `Status` is `204` or `304`), plus its `Header` | every status the handler can pick; `Freeze` cannot check these |
 | anything else (a struct, a slice, `Page[T]`, `List[T]`, …) | `200` | the value | `200` |
 
 Bodies are encoded with `encoding/json` as `application/json`. If encoding fails, the
 response is a `500` with the fixed body
-`{"error":"failed to encode response","code":"INTERNAL_ERROR"}`. For headers such as
-`Cache-Control` or `ETag`, return a `Response[T]`; its `Header` is added to the response
-before the body is written:
+`{"error":"failed to encode response","code":"INTERNAL_ERROR"}`. A `204` or `304` has no
+content, so it is written with its status and headers only: no body, and no
+`Content-Type`, `Content-Length`, or `Transfer-Encoding`, even when a handler or a
+middleware set one. That holds for error responses too.
+
+For headers such as `Cache-Control` or `ETag`, return a `Response[T]`; its `Header` is
+added to the response before the body is written:
 
 ```go
 Handle: func(_ context.Context, req GetUserRequest) (actions.Response[User], error) {

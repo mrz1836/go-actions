@@ -89,9 +89,12 @@ type Accepted[T any] struct{ Body T }
 // Response wraps a body with an explicit status and optional response headers,
 // for handlers that need control beyond Created/Accepted/Empty — e.g. setting
 // Cache-Control or ETag, or returning a non-standard 2xx. Status defaults to 200
-// when zero. Headers are added to the response before the body is written. For
-// OpenAPI schema generation it unwraps to its Body type; because its status is
-// chosen at runtime, Freeze cannot check that the status is documented.
+// when zero. Headers are added to the response before the body is written. A
+// 204 or 304 is written without a body, and without Content-Type,
+// Content-Length, or Transfer-Encoding: Body is ignored, and Header still
+// applies. For OpenAPI schema generation it unwraps to its Body type; because
+// its status is chosen at runtime, Freeze cannot check that the status is
+// documented.
 type Response[T any] struct {
 	Status int
 	Header http.Header

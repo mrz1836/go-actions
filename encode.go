@@ -53,7 +53,8 @@ type headerEnvelope interface {
 
 // encodeResponse writes a successful response. An Empty/Created/Accepted/Response
 // wrapper sets the documented status (and Response may add headers); any other
-// value is encoded as 200.
+// value is encoded as 200. A 204 or 304 is written without a body (see
+// writeJSON).
 func encodeResponse(w http.ResponseWriter, resp any) {
 	if h, ok := resp.(headerEnvelope); ok {
 		for key, vals := range h.envelopeHeaders() {
@@ -63,22 +64,30 @@ func encodeResponse(w http.ResponseWriter, resp any) {
 		}
 	}
 	if env, ok := resp.(responseEnvelope); ok {
-		status := env.envelopeStatus()
-		if status == http.StatusNoContent {
-			w.WriteHeader(status)
-			return
-		}
-		writeJSON(w, status, env.envelopeBody())
+		writeJSON(w, env.envelopeStatus(), env.envelopeBody())
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // writeJSON serializes data as JSON and writes it to w with the given HTTP
-// status. Content-Type is always set to application/json. If marshaling fails,
-// a 500 with a static error body is written instead — the original status is
-// discarded.
+// status and Content-Type application/json. If marshaling fails, a 500 with a
+// static error body is written instead — the original status is discarded.
+//
+// A 204 No Content or 304 Not Modified carries no content (RFC 9110), so for
+// those data is ignored: the headers that describe a body (Content-Type,
+// Content-Length, Transfer-Encoding) are removed, and only the status and the
+// remaining headers are written. Success and error responses share this rule,
+// since both are written here.
 func writeJSON(w http.ResponseWriter, status int, data any) {
+	if status == http.StatusNoContent || status == http.StatusNotModified {
+		h := w.Header()
+		h.Del("Content-Type")
+		h.Del("Content-Length")
+		h.Del("Transfer-Encoding")
+		w.WriteHeader(status)
+		return
+	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		w.Header()["Content-Type"] = jsonContentType
