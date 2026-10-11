@@ -666,19 +666,33 @@ func TestSchemaTypedEnumAndStringFormats(t *testing.T) {
 		Level int       `json:"level" validate:"oneof=1 2 3"`
 		Ratio float64   `json:"ratio" validate:"oneof=0.5 1"`
 		Kind  string    `json:"kind" validate:"oneof=a b"`
-		Bad   int       `json:"bad" validate:"oneof=1 two"`
-		Code  int       `json:"code" validate:"uuid,email"`
-		When  time.Time `json:"when" validate:"rfc3339"`
+		When  time.Time `json:"when"`
 		Phone string    `json:"phone" validate:"e164"`
 	}
 	got := propsJSON(t, newSchemaBuilder().structSchema(reflect.TypeFor[req](), modeRequest))
 	assert.JSONEq(t, `{"type":"integer","enum":[1,2,3]}`, got["level"])
 	assert.JSONEq(t, `{"type":"number","enum":[0.5,1]}`, got["ratio"])
 	assert.JSONEq(t, `{"type":"string","enum":["a","b"]}`, got["kind"])
-	assert.JSONEq(t, `{"type":"integer"}`, got["bad"], "a malformed oneof is not documented")
-	assert.JSONEq(t, `{"type":"integer"}`, got["code"], "format rules document only strings")
 	assert.JSONEq(t, `{"type":"string","format":"date-time"}`, got["when"])
 	assert.JSONEq(t, `{"type":"string","pattern":"^\\+[1-9]\\d{1,14}$"}`, got["phone"])
+
+	type (
+		bad struct {
+			Bad int `json:"bad" validate:"oneof=1 two"`
+		}
+		code struct {
+			Code int `json:"code" validate:"uuid,email"`
+		}
+		when struct {
+			When time.Time `json:"when" validate:"rfc3339"`
+		}
+	)
+	assert.Equal(t, `actions: action "x.list": field "bad": validate rule "oneof" has an invalid argument`,
+		freezeRefusal[bad, Empty](t), "a malformed oneof is refused")
+	assert.Equal(t, `actions: action "x.list": field "code": validate rule "uuid" does not apply to int`,
+		freezeRefusal[code, Empty](t), "format rules fit only strings")
+	assert.Equal(t, `actions: action "x.list": field "when": validate rule "rfc3339" does not apply to time.Time`,
+		freezeRefusal[when, Empty](t), "a time.Time is already a date-time")
 
 	t.Run("a nullable integer enum admits null", func(t *testing.T) {
 		type Resp struct {
@@ -953,15 +967,20 @@ func TestSchemaDateFormat(t *testing.T) {
 		]`, jsonOf(t, buildParameters(newSchemaBuilder(), reflect.TypeFor[params]())))
 	})
 
-	t.Run("other shapes and unknown rules are not documented", func(t *testing.T) {
+	t.Run("other shapes and unknown rules are refused", func(t *testing.T) {
 		t.Parallel()
-		type other struct {
-			Count int    `json:"count" validate:"date"`
-			Stamp string `json:"stamp" validate:"datetime"`
-		}
-		body := requestBodyOf(t, contractFor[other, struct{}](t))
-		assert.JSONEq(t, `{"type":"integer"}`, jsonOf(t, propertyOf(t, body, "count")))
-		assert.JSONEq(t, `{"type":"string"}`, jsonOf(t, propertyOf(t, body, "stamp")))
+		type (
+			count struct {
+				Count int `json:"count" validate:"date"`
+			}
+			stamp struct {
+				Stamp string `json:"stamp" validate:"datetime"`
+			}
+		)
+		assert.Equal(t, `actions: action "x.list": field "count": validate rule "date" does not apply to int`,
+			freezeRefusal[count, struct{}](t))
+		assert.Equal(t, `actions: action "x.list": field "stamp": unknown validate rule "datetime"`,
+			freezeRefusal[stamp, struct{}](t))
 	})
 
 	t.Run("a date field is never a pattern or a date-time", func(t *testing.T) {

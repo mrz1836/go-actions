@@ -218,7 +218,8 @@ func (b *schemaBuilder) structSchema(t reflect.Type, mode schemaMode) map[string
 	var required []string
 	for _, jf := range jsonFields(t) {
 		f := jf.field
-		rules := parseRules(f.Tag.Get("validate"), f.Type)
+		// Freeze has already refused a tag with a rule parseRules refuses.
+		rules, _ := parseRules(f.Tag.Get("validate"), f.Type)
 		// In a response, a field without omitempty/omitzero is always written
 		// — unless it is promoted through an embedded pointer, which omits it
 		// while nil.
@@ -280,16 +281,24 @@ func (b *schemaBuilder) nullable(schema map[string]any) map[string]any {
 // responseSchema returns the JSON Schema of an action's response body. An Empty
 // response has no body; a Created/Accepted wrapper unwraps to its Body type.
 func (b *schemaBuilder) responseSchema(respType reflect.Type) (map[string]any, bool) {
+	body, ok := responseBodyType(respType)
+	if !ok {
+		return nil, false
+	}
+	return b.schemaFor(body, modeResponse), true
+}
+
+// responseBodyType returns the type of an action's response body: Created,
+// Accepted, and Response unwrap to their Body type, and Empty has no body.
+func responseBodyType(respType reflect.Type) (reflect.Type, bool) {
 	for respType.Kind() == reflect.Pointer {
 		respType = respType.Elem()
 	}
-	if respType.Implements(envelopeType) || reflect.PointerTo(respType).Implements(envelopeType) {
-		if field, ok := respType.FieldByName("Body"); ok {
-			return b.schemaFor(field.Type, modeResponse), true
-		}
-		return nil, false // Empty
+	if implements(respType, envelopeType) {
+		field, ok := respType.FieldByName("Body")
+		return field.Type, ok
 	}
-	return b.schemaFor(respType, modeResponse), true
+	return respType, true
 }
 
 // components returns the document's component schemas, merging the two modes.

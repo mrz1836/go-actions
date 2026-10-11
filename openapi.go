@@ -138,7 +138,8 @@ func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 	}
 	var params []any
 	for _, p := range paramFields(reqType) {
-		rules := parseRules(p.field.Tag.Get("validate"), p.field.Type)
+		// Freeze has already refused a tag with a rule parseRules refuses.
+		rules, _ := parseRules(p.field.Tag.Get("validate"), p.field.Type)
 		schema := sb.schemaFor(p.field.Type, modeRequest)
 		applyConstraints(schema, rules)
 		param := map[string]any{

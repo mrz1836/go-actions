@@ -305,6 +305,9 @@ func structType(t reflect.Type) reflect.Type {
 //     Accepted, 200 otherwise) is not documented by a non-error StatusDoc —
 //     Response[T], whose status is chosen at runtime, is exempt;
 //   - a duplicate ID, or two actions routing the same Method and path;
+//   - a validate rule that is unknown (omitempty included), that does not
+//     apply to its field's type, or whose argument is malformed, on any field
+//     of a request or response type, nested ones included;
 //   - a parameter whose type cannot bind: a slice in the path or a header; in
 //     the query, a slice of anything but the scalar types, or a []byte; a
 //     pointer to a slice or to another pointer; a map, an array, an
@@ -442,7 +445,7 @@ func (r *Registry) validateActions() {
 		}
 		seenRoute[route] = a.id
 
-		if err := checkAction(a.id, a.reqType); err != nil {
+		if err := checkAction(a.id, a.reqType, a.respType); err != nil {
 			panic(err.Error())
 		}
 	}

@@ -111,30 +111,76 @@ var formatMessages = map[ruleKind]string{
 	ruleDate:    "must be a calendar date (YYYY-MM-DD)",
 }
 
-// parseRules parses a validate tag for a field of type t. A rule that does not
-// apply to the field's shape, that is malformed, or that is unknown is dropped,
-// so it is neither enforced nor documented.
-func parseRules(tag string, t reflect.Type) []rule {
+// ruleProblem is why parseRules refused a rule.
+type ruleProblem uint8
+
+const (
+	ruleAccepted    ruleProblem = iota
+	ruleUnknown                 // no rule has that name
+	ruleMisapplied              // the rule does not apply to the field's type
+	ruleBadArgument             // the argument is missing, unexpected, or malformed
+)
+
+// ruleError is a validate rule parseRules refused, worded as Freeze reports it
+// after the field's path.
+type ruleError struct {
+	rule    string // the rule's name, e.g. "min"
+	problem ruleProblem
+	typ     reflect.Type // the field's declared type
+}
+
+// Error describes the refused rule.
+func (e *ruleError) Error() string {
+	switch e.problem { //nolint:exhaustive // the default case is ruleBadArgument
+	case ruleUnknown:
+		return fmt.Sprintf("unknown validate rule %q", e.rule)
+	case ruleMisapplied:
+		return fmt.Sprintf("validate rule %q does not apply to %s", e.rule, e.typ)
+	default:
+		return fmt.Sprintf("validate rule %q has an invalid argument", e.rule)
+	}
+}
+
+// parseRules parses a validate tag for a field of type t. It returns the rules
+// it accepted and a *ruleError for the first rule it refused: an unknown rule,
+// a rule that does not apply to the field's type, or one whose argument is
+// malformed. A blank segment carries no rule and is skipped. Freeze panics on
+// the refusal, so the validator and the schema generator only ever run on a
+// tag whose every rule was accepted.
+func parseRules(tag string, t reflect.Type) ([]rule, error) {
 	if tag == "" {
-		return nil
+		return nil, nil
 	}
 	shape := shapeOf(t)
 	var rules []rule
+	var refused error
 	for _, raw := range strings.Split(tag, ",") {
-		key, arg, _ := strings.Cut(strings.TrimSpace(raw), "=")
-		if r, ok := parseRule(key, arg, shape); ok {
-			rules = append(rules, r)
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
 		}
+		key, arg, hasArg := strings.Cut(raw, "=")
+		r, problem := parseRule(key, arg, hasArg, shape)
+		if problem != ruleAccepted {
+			if refused == nil {
+				refused = &ruleError{rule: key, problem: problem, typ: t}
+			}
+			continue
+		}
+		rules = append(rules, r)
 	}
-	return rules
+	return rules, refused
 }
 
-// parseRule parses one rule for a field of the given shape, reporting false
-// when the rule is dropped.
-func parseRule(key, arg string, shape valueShape) (rule, bool) {
+// parseRule parses one rule for a field of the given shape, reporting why it
+// was refused, if it was. hasArg reports that the rule was written with "=".
+func parseRule(key, arg string, hasArg bool, shape valueShape) (rule, ruleProblem) {
 	switch key {
 	case "required":
-		return rule{kind: ruleRequired, shape: shape, msg: "is required"}, true
+		if hasArg {
+			return rule{}, ruleBadArgument
+		}
+		return rule{kind: ruleRequired, shape: shape, msg: "is required"}, ruleAccepted
 	case "min":
 		return parseBound(ruleMin, arg, shape)
 	case "max":
@@ -155,17 +201,20 @@ func parseRule(key, arg string, shape valueShape) (rule, bool) {
 	case "date":
 		kind = ruleDate
 	default:
-		return rule{}, false
+		return rule{}, ruleUnknown
 	}
-	if shape != shapeString {
-		return rule{}, false
+	switch {
+	case shape != shapeString:
+		return rule{}, ruleMisapplied
+	case hasArg:
+		return rule{}, ruleBadArgument
 	}
-	return rule{kind: kind, shape: shape, msg: formatMessages[kind]}, true
+	return rule{kind: kind, shape: shape, msg: formatMessages[kind]}, ruleAccepted
 }
 
 // parseBound parses a min/max rule. A number bound must be finite; a length
 // bound (string, slice, array, map) must be a non-negative integer.
-func parseBound(kind ruleKind, arg string, shape valueShape) (rule, bool) {
+func parseBound(kind ruleKind, arg string, shape valueShape) (rule, ruleProblem) {
 	var unit string
 	switch shape { //nolint:exhaustive // other shapes take no bound
 	case shapeString:
@@ -174,47 +223,53 @@ func parseBound(kind ruleKind, arg string, shape valueShape) (rule, bool) {
 		unit = " items"
 	case shapeInt, shapeUint, shapeFloat:
 	default:
-		return rule{}, false
+		return rule{}, ruleMisapplied
 	}
 	limit, err := strconv.ParseFloat(arg, 64)
 	if err != nil || math.IsInf(limit, 0) || math.IsNaN(limit) {
-		return rule{}, false
+		return rule{}, ruleBadArgument
 	}
 	if unit != "" && (limit < 0 || limit != math.Trunc(limit)) {
-		return rule{}, false
+		return rule{}, ruleBadArgument
 	}
 	bound := strconv.FormatFloat(limit, 'f', -1, 64)
 	msg := "must be at most " + bound + unit
 	if kind == ruleMin {
 		msg = "must be at least " + bound + unit
 	}
-	return rule{kind: kind, shape: shape, limit: limit, msg: msg}, true
+	return rule{kind: kind, shape: shape, limit: limit, msg: msg}, ruleAccepted
 }
 
 // parseOneOf parses a oneof rule: space-separated values, each of which must
 // parse as the field's kind (string, integer, unsigned integer, or number).
-func parseOneOf(arg string, shape valueShape) (rule, bool) {
+func parseOneOf(arg string, shape valueShape) (rule, ruleProblem) {
+	switch shape { //nolint:exhaustive // other shapes take no oneof
+	case shapeString, shapeInt, shapeUint, shapeFloat:
+	default:
+		return rule{}, ruleMisapplied
+	}
 	allowed := strings.Fields(arg)
 	if len(allowed) == 0 {
-		return rule{}, false
+		return rule{}, ruleBadArgument
 	}
 	enum := make([]any, len(allowed))
 	for i, tok := range allowed {
 		v, ok := parseEnumValue(tok, shape)
 		if !ok {
-			return rule{}, false
+			return rule{}, ruleBadArgument
 		}
 		enum[i] = v
 	}
 	return rule{
 		kind: ruleOneOf, shape: shape, allowed: allowed, enum: enum,
 		msg: "must be one of: " + strings.Join(allowed, ", "),
-	}, true
+	}, ruleAccepted
 }
 
-// parseEnumValue parses one oneof value as the given shape.
+// parseEnumValue parses one oneof value as the given shape, one of those
+// parseOneOf admits.
 func parseEnumValue(tok string, shape valueShape) (any, bool) {
-	switch shape { //nolint:exhaustive // other shapes take no oneof
+	switch shape { //nolint:exhaustive // parseOneOf admits only these shapes
 	case shapeString:
 		return tok, true
 	case shapeInt:
@@ -223,11 +278,9 @@ func parseEnumValue(tok string, shape valueShape) (any, bool) {
 	case shapeUint:
 		n, err := strconv.ParseUint(tok, 10, 64)
 		return n, err == nil
-	case shapeFloat:
+	default:
 		n, err := strconv.ParseFloat(tok, 64)
 		return n, err == nil && !math.IsInf(n, 0) && !math.IsNaN(n)
-	default:
-		return nil, false
 	}
 }
 
@@ -703,9 +756,11 @@ func (c *validatorCompiler) field(name string, index []int, sf reflect.StructFie
 	return f
 }
 
-// newVField builds a field with its parsed rules.
+// newVField builds a field with its parsed rules. A tag with a refused rule
+// never reaches a request, because Freeze panics on it.
 func newVField(name string, index []int, tag string, t reflect.Type) vfield {
-	f := vfield{name: name, index: index, rules: parseRules(tag, t)}
+	rules, _ := parseRules(tag, t)
+	f := vfield{name: name, index: index, rules: rules}
 	for _, r := range f.rules {
 		if r.kind == ruleRequired {
 			f.required = true

@@ -121,6 +121,9 @@ misdeclared route fails on boot, not in production. It rejects:
   `Accepted`, `200` for anything else) is not documented by a non-error `StatusDoc`
   (`Response[T]` is exempt: it picks its status at runtime);
 - a duplicate `ID`, or two actions routing the same method and path;
+- a `validate` rule that is unknown (`omitempty` included), that doesn't apply to its
+  field's type, or whose argument is malformed, on any field of a request or response type
+  ("Rejected rules" under **Validation tags** below);
 - a parameter field whose type can't bind (**Request binding** below); and
 - two different types that would share a component schema name, a type named `Error`,
   or a `<Name>Input` name that is already taken.
@@ -787,11 +790,18 @@ constraints. One parser reads the rules for both sides:
 | `rfc3339` | strings | `time.Parse(time.RFC3339, …)` accepts it | `format: date-time` |
 | `date` | strings | a calendar date written `YYYY-MM-DD`: `time.Parse(time.DateOnly, …)` accepts it (so `2026-02-30` fails) and formatting the result gives the input back; a timestamp fails | `format: date` |
 
-- **Ignored rules.** A rule on a type it does not apply to (`email` on an `int`, `min` on a
-  `bool`) is ignored on both sides: neither enforced nor documented. So is a malformed rule
-  (a length bound that is not a non-negative integer, a non-finite number, a `oneof` value
-  that does not parse as the field's type) and an unknown rule. On a `[]byte`, `min`/`max`
-  count bytes at runtime, but the schema (a base64 string) carries no bound.
+- **Rejected rules.** `Freeze()` panics on a rule it can't enforce, so no rule is silently
+  dropped. It checks every field of a request or response type, nested fields included, and
+  names the field by its path, with `[]` for any element or map value (`lines[].qty`):
+
+  | Case | `Freeze()` panics with |
+  | --- | --- |
+  | an unknown rule, `omitempty` and `dive` included | `actions: action "<id>": field "<path>": unknown validate rule "<rule>"` |
+  | a rule on a type it doesn't apply to: `email` on an `int`, `min` on a `bool`, `rfc3339` on a `time.Time`, `oneof` on a slice | `actions: action "<id>": field "<path>": validate rule "<rule>" does not apply to <Go type>` |
+  | a malformed argument: a length bound that isn't a non-negative integer (`min=-1` on a string), a non-finite number, a `oneof` with no values or with a value that doesn't parse as the field's type, or an argument on a rule that takes none (`required=true`) | `actions: action "<id>": field "<path>": validate rule "<rule>" has an invalid argument` |
+
+  A blank segment (`required,,max=3`) carries no rule and is skipped. On a `[]byte`,
+  `min`/`max` count bytes at runtime, but the schema (a base64 string) carries no bound.
 - **Zero values.** Every rule except `required` skips a non-pointer field holding its zero
   value, so `min=1` on an `int` accepts `0`. `required` fails on an empty string, a slice or
   map with no elements, a zero number, `false`, a nil pointer or interface, and a struct or

@@ -8,18 +8,31 @@ import (
 // declError is one declaration problem, which Freeze panics with.
 type declError struct {
 	subject string // `action "<id>"`
-	detail  string // `parameter "<name>": …`
+	detail  string // `field "<path>": …` or `parameter "<name>": …`
 }
 
 // Error renders the problem as Freeze reports it.
 func (e *declError) Error() string { return "actions: " + e.subject + ": " + e.detail }
 
-// checkAction returns the first problem in an action's declaration, or nil: a
-// parameter the decoder cannot bind.
-func checkAction(id string, reqType reflect.Type) error {
-	c := &declChecker{subject: fmt.Sprintf("action %q", id)}
+// checkAction returns the first problem in an action's declaration, or nil:
+// first its parameters, then its request body fields, then its response body
+// fields, each depth first in field order. It reads every field the decoder
+// binds, the validator checks, or the schema generator documents, and so
+// refuses a parameter the decoder cannot bind and a validate rule that would
+// otherwise be dropped (see parseRules).
+func checkAction(id string, reqType, respType reflect.Type) error {
+	c := &declChecker{subject: fmt.Sprintf("action %q", id), seen: map[reflect.Type]bool{}}
 	if st := structType(reqType); st != nil {
-		return c.params(st)
+		c.seen[st] = true
+		if err := c.params(st); err != nil {
+			return err
+		}
+		if err := c.fields(st, ""); err != nil {
+			return err
+		}
+	}
+	if body, ok := responseBodyType(respType); ok {
+		return c.value(body, "")
 	}
 	return nil
 }
@@ -27,6 +40,9 @@ func checkAction(id string, reqType reflect.Type) error {
 // declChecker walks one action's types for checkAction.
 type declChecker struct {
 	subject string
+	// seen holds the types already walked, which ends recursion: a field's
+	// problem depends on its type, not on the path that reached it.
+	seen map[reflect.Type]bool
 }
 
 // fail returns the declaration error for detail.
@@ -34,15 +50,59 @@ func (c *declChecker) fail(detail string) error {
 	return &declError{subject: c.subject, detail: detail}
 }
 
-// params checks that each parameter field of request struct t can bind from
-// its location.
+// params checks the parameter fields of request struct t: that each type can
+// bind from its location, then its validate rules, under the parameter's name.
 func (c *declChecker) params(t reflect.Type) error {
 	for _, p := range paramFields(t) {
 		if !bindable(p.field.Type, p.in) {
 			return c.fail(fmt.Sprintf("parameter %q: %s cannot be a %s parameter", p.name, p.field.Type, p.in))
 		}
+		if _, err := parseRules(p.field.Tag.Get("validate"), p.field.Type); err != nil {
+			return c.fail(fmt.Sprintf("field %q: %v", p.name, err))
+		}
 	}
 	return nil
+}
+
+// fields checks the validate rules of struct t's JSON fields, then descends
+// into each field's value. prefix is the path of t's value ("" at the top).
+func (c *declChecker) fields(t reflect.Type, prefix string) error {
+	for _, jf := range jsonFields(t) {
+		path := jf.name
+		if prefix != "" {
+			path = prefix + "." + jf.name
+		}
+		if _, err := parseRules(jf.field.Tag.Get("validate"), jf.field.Type); err != nil {
+			return c.fail(fmt.Sprintf("field %q: %v", path, err))
+		}
+		if err := c.value(jf.field.Type, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// value descends into a value of type t (pointers followed) at path: a
+// struct's fields, and the elements of a slice or array or the values of a
+// map, named "<path>[]". Like the validator and the schema generator, it never
+// descends into a type that encodes itself.
+func (c *declChecker) value(t reflect.Type, path string) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if c.seen[t] || encodesItself(t) {
+		return nil
+	}
+	switch t.Kind() { //nolint:exhaustive // other kinds hold no fields
+	case reflect.Struct:
+		c.seen[t] = true
+		return c.fields(t, path)
+	case reflect.Slice, reflect.Array, reflect.Map:
+		c.seen[t] = true
+		return c.value(t.Elem(), path+"[]")
+	default:
+		return nil
+	}
 }
 
 // bindable reports whether a parameter of type t binds from location in: with
