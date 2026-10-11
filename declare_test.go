@@ -359,3 +359,96 @@ func TestFreezeAcceptsEveryFittingRule(t *testing.T) {
 	assert.Empty(t, freezeRefusal[*fitParams, Created[[]fitBodyFields]](t), "pointer and wrapped types")
 	assert.Empty(t, freezeRefusal[int, Response[map[string]fitBodyFields]](t), "a non-struct request")
 }
+
+// Fixtures for self-referencing types.
+type (
+	// selfTree is unexported, so its schema would be inlined into itself.
+	selfTree struct {
+		Label    string     `json:"label"`
+		Children []selfTree `json:"children"`
+	}
+	// selfList refers to itself through a pointer.
+	selfList struct {
+		Value int       `json:"value"`
+		Next  *selfList `json:"next"`
+	}
+	// selfPing and selfPong refer to each other through a map value.
+	selfPing struct {
+		Pongs map[string]selfPong `json:"pongs"`
+	}
+	selfPong struct {
+		Ping *selfPing `json:"ping"`
+	}
+	// selfViaComponent refers to itself only through SelfComponent, an
+	// exported type whose schema is a component, so a $ref ends the cycle.
+	selfViaComponent struct {
+		Via SelfComponent `json:"via"`
+	}
+	// SelfComponent is exported, so it becomes a component.
+	SelfComponent struct {
+		Back []selfViaComponent `json:"back"`
+	}
+	// selfLeaf is unexported and refers to nothing, so inlining it ends.
+	selfLeaf struct {
+		Name  string     `json:"name"`
+		Again *selfLeafs `json:"again"`
+	}
+	selfLeafs struct {
+		One selfTwin `json:"one"`
+		Two selfTwin `json:"two"`
+	}
+	selfTwin struct {
+		Name string `json:"name"`
+	}
+	// SelfExported is exported, so its schema is a component, and its own
+	// field refers back to it by $ref.
+	SelfExported struct {
+		Kids []SelfExported `json:"kids"`
+	}
+	// SelfRequest is exported, so a field of its own type is a $ref to its
+	// component, although the request body itself is inlined.
+	SelfRequest struct {
+		Parent *SelfRequest `json:"parent"`
+	}
+)
+
+// SelfGeneric is generic, so its schema would be inlined into itself.
+type SelfGeneric[T any] struct {
+	Value T                `json:"value"`
+	Kids  []SelfGeneric[T] `json:"kids"`
+}
+
+func TestFreezeRefusesASelfReferencingInlinedType(t *testing.T) {
+	const fix = "; a self-referencing type needs an exported, non-generic name, so its schema can be a component"
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{
+			"an unexported response type, through a slice", freezeRefusal[struct{}, selfTree](t),
+			`actions: action "x.list": field "children[]": actions.selfTree refers to itself` + fix,
+		},
+		{
+			"an unexported request type, through a pointer", freezeRefusal[selfList, Empty](t),
+			`actions: action "x.list": field "next": actions.selfList refers to itself` + fix,
+		},
+		{
+			"two unexported types, through a map value", freezeRefusal[selfPing, Empty](t),
+			`actions: action "x.list": field "pongs[].ping": actions.selfPing refers to itself` + fix,
+		},
+		{
+			"a generic type", freezeRefusal[struct{}, Created[SelfGeneric[int]]](t),
+			`actions: action "x.list": field "kids[]": actions.SelfGeneric[int] refers to itself` + fix,
+		},
+		{"an exported type", freezeRefusal[SelfExported, SelfExported](t), ""},
+		{"an unexported type whose cycle passes through a component", freezeRefusal[selfViaComponent, selfViaComponent](t), ""},
+		{"an exported request type", freezeRefusal[SelfRequest, Empty](t), ""},
+		{"an unexported type used twice, and by the request and the response", freezeRefusal[selfLeaf, selfLeaf](t), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.got)
+		})
+	}
+}

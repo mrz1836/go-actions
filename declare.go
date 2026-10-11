@@ -18,12 +18,22 @@ func (e *declError) Error() string { return "actions: " + e.subject + ": " + e.d
 // first its parameters, then its request body fields, then its response body
 // fields, each depth first in field order. It reads every field the decoder
 // binds, the validator checks, or the schema generator documents, and so
-// refuses a parameter the decoder cannot bind and a validate rule that would
-// otherwise be dropped (see parseRules).
+// refuses a parameter the decoder cannot bind, a validate rule that would
+// otherwise be dropped (see parseRules), and a type that refers to itself but
+// whose schema would be inlined into itself (see structFields).
 func checkAction(id string, reqType, respType reflect.Type) error {
-	c := &declChecker{subject: fmt.Sprintf("action %q", id), seen: map[reflect.Type]bool{}}
+	c := &declChecker{
+		subject:  fmt.Sprintf("action %q", id),
+		seen:     map[reflect.Type]bool{},
+		inlining: map[reflect.Type]bool{},
+	}
 	if st := structType(reqType); st != nil {
+		// The request body's schema is always inlined, but a field of its own
+		// type gets the component's $ref when the type is one.
 		c.seen[st] = true
+		if inlinesStruct(st) {
+			c.inlining[st] = true
+		}
 		if err := c.params(st); err != nil {
 			return err
 		}
@@ -32,6 +42,7 @@ func checkAction(id string, reqType, respType reflect.Type) error {
 		}
 	}
 	if body, ok := responseBodyType(respType); ok {
+		c.inlining = map[reflect.Type]bool{} // the response schema is built on its own
 		return c.value(body, "")
 	}
 	return nil
@@ -43,6 +54,9 @@ type declChecker struct {
 	// seen holds the types already walked, which ends recursion: a field's
 	// problem depends on its type, not on the path that reached it.
 	seen map[reflect.Type]bool
+	// inlining holds the inlined struct types whose schemas enclose the value
+	// being walked (see structFields).
+	inlining map[reflect.Type]bool
 }
 
 // fail returns the declaration error for detail.
@@ -90,19 +104,43 @@ func (c *declChecker) value(t reflect.Type, path string) error {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	if c.seen[t] || encodesItself(t) {
+	if encodesItself(t) {
 		return nil
 	}
+	if c.inlining[t] {
+		return c.fail(fmt.Sprintf("field %q: %s refers to itself; a self-referencing type needs an exported, "+
+			"non-generic name, so its schema can be a component", path, t))
+	}
+	if c.seen[t] {
+		return nil
+	}
+	c.seen[t] = true
 	switch t.Kind() { //nolint:exhaustive // other kinds hold no fields
 	case reflect.Struct:
-		c.seen[t] = true
-		return c.fields(t, path)
+		return c.structFields(t, path)
 	case reflect.Slice, reflect.Array, reflect.Map:
-		c.seen[t] = true
 		return c.value(t.Elem(), path+"[]")
 	default:
 		return nil
 	}
+}
+
+// structFields walks struct t's fields, tracking the inlined struct types
+// whose schemas enclose them. The schema generator inlines an unnamed,
+// unexported, or generic struct (see inlinesStruct), so meeting such a type
+// again inside its own schema means that schema would never end: only a
+// component can be referred back to. A component's schema is a $ref, which
+// ends every cycle through it, so its fields start with none enclosing them.
+func (c *declChecker) structFields(t reflect.Type, path string) error {
+	if inlinesStruct(t) {
+		c.inlining[t] = true
+		defer delete(c.inlining, t)
+		return c.fields(t, path)
+	}
+	enclosing := c.inlining
+	c.inlining = map[reflect.Type]bool{}
+	defer func() { c.inlining = enclosing }()
+	return c.fields(t, path)
 }
 
 // bindable reports whether a parameter of type t binds from location in: with

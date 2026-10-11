@@ -124,7 +124,9 @@ misdeclared route fails on boot, not in production. It rejects:
 - a `validate` rule that is unknown (`omitempty` included), that doesn't apply to its
   field's type, or whose argument is malformed, on any field of a request or response type
   ("Rejected rules" under **Validation tags** below);
-- a parameter field whose type can't bind (**Request binding** below); and
+- a parameter field whose type can't bind (**Request binding** below);
+- a type that refers to itself but would be inlined, because it is unexported or generic
+  (**Schema generation** below); and
 - two different types that would share a component schema name, a type named `Error`,
   or a `<Name>Input` name that is already taken.
 
@@ -883,6 +885,12 @@ type (
   or generic type (`Page[User]`) is inlined, and so is the top-level request body.
 - **Name collisions:** two different types with the same name (say, from two packages)
   panic at `Freeze`; rename one. `Error` is reserved for the framework's error envelope.
+- **Self-referencing types:** a schema can refer back to a type only by its component's
+  `$ref`, so a type that refers to itself, directly or through other types, must be named,
+  exported, and not generic. If every type on the cycle would be inlined, `Freeze` panics
+  instead of building a schema that never ends:
+  `actions: action "<id>": field "<path>": <Go type> refers to itself; a self-referencing type needs an exported, non-generic name, so its schema can be a component`.
+  A cycle that passes through one component is fine.
 
 **Fields.** The field set follows `encoding/json`'s rules:
 
