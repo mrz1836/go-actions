@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -122,5 +123,98 @@ func TestEnvelopeDefaults(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 		assert.Equal(t, `"v1"`, w.Header().Get("ETag"))
 		assert.JSONEq(t, `{"n":1}`, w.Body.String())
+	})
+}
+
+func TestNotModifiedResponseHasNoBody(t *testing.T) {
+	t.Parallel()
+	notModified := Response[map[string]string]{
+		Status: http.StatusNotModified,
+		Header: http.Header{"Etag": {`"v1"`}, "Cache-Control": {"max-age=60"}},
+		Body:   map[string]string{"id": "x"},
+	}
+
+	t.Run("the encoder writes headers and no body", func(t *testing.T) {
+		t.Parallel()
+		w := httptest.NewRecorder()
+		encodeResponse(w, notModified)
+		assert.Equal(t, http.StatusNotModified, w.Code)
+		assert.Equal(t, `"v1"`, w.Header().Get("ETag"))
+		assert.Equal(t, "max-age=60", w.Header().Get("Cache-Control"))
+		assert.Empty(t, w.Header().Values("Content-Type"))
+		assert.Empty(t, w.Body.String())
+	})
+
+	t.Run("an action served through the registry", func(t *testing.T) {
+		t.Parallel()
+		reg := NewRegistry()
+		Register(reg, Action[struct{}, Response[map[string]string]]{
+			ID: "test.cached", Method: http.MethodGet, Path: "/cached",
+			Statuses: []StatusDoc{{Code: http.StatusOK}, {Code: http.StatusNotModified}},
+			Handle: func(context.Context, struct{}) (Response[map[string]string], error) {
+				return notModified, nil
+			},
+		})
+		reg.Freeze()
+		w := httptest.NewRecorder()
+		reg.Handler().ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/cached", nil))
+		assert.Equal(t, http.StatusNotModified, w.Code)
+		assert.Equal(t, `"v1"`, w.Header().Get("ETag"))
+		assert.Empty(t, w.Header().Values("Content-Type"))
+		assert.Empty(t, w.Body.String())
+	})
+
+	t.Run("the error path writes no body either", func(t *testing.T) {
+		t.Parallel()
+		w := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+		NewRegistry().writeAPIError(w, req, APIError{Status: http.StatusNotModified, Code: "NOT_MODIFIED", Message: "unchanged"})
+		assert.Equal(t, http.StatusNotModified, w.Code)
+		assert.Empty(t, w.Header().Values("Content-Type"))
+		assert.Empty(t, w.Body.String())
+	})
+}
+
+func TestNoContentResponseHasNoContentType(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a Response drops the headers that describe a body", func(t *testing.T) {
+		t.Parallel()
+		w := httptest.NewRecorder()
+		encodeResponse(w, Response[map[string]string]{
+			Status: http.StatusNoContent,
+			Header: http.Header{
+				"Content-Type":   {"application/json"},
+				"Content-Length": {"2"},
+				"X-Request-Kind": {"delete"},
+			},
+			Body: map[string]string{"id": "x"},
+		})
+		assert.Equal(t, http.StatusNoContent, w.Code)
+		assert.Empty(t, w.Header().Values("Content-Type"))
+		assert.Empty(t, w.Header().Values("Content-Length"))
+		assert.Equal(t, "delete", w.Header().Get("X-Request-Kind"), "other headers are kept")
+		assert.Empty(t, w.Body.String())
+	})
+
+	t.Run("Empty stays a bare 204", func(t *testing.T) {
+		t.Parallel()
+		w := httptest.NewRecorder()
+		encodeResponse(w, Empty{})
+		assert.Equal(t, http.StatusNoContent, w.Code)
+		assert.Empty(t, w.Header())
+		assert.Empty(t, w.Body.String())
+	})
+
+	t.Run("headers set before the encoder runs are dropped too", func(t *testing.T) {
+		t.Parallel()
+		w := httptest.NewRecorder()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Transfer-Encoding", "chunked")
+		encodeResponse(w, Empty{})
+		assert.Equal(t, http.StatusNoContent, w.Code)
+		assert.Empty(t, w.Header().Values("Content-Type"))
+		assert.Empty(t, w.Header().Values("Transfer-Encoding"))
+		assert.Empty(t, w.Body.String())
 	})
 }
