@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -294,23 +297,237 @@ func TestDecodeRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("unbindable field kind returns 500 instead of panicking", func(t *testing.T) {
+	t.Run("a slice query field binds every value", func(t *testing.T) {
 		t.Parallel()
-		// A slice-kind query field is a server-side declaration error: it must
-		// fail cleanly, not panic on reflect.Value.SetString.
 		type req struct {
 			Tags []string `json:"-" query:"tags"`
 		}
-		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?tags=a", nil)
-		_, err := decodeRequest[req](r, false)
-		var apiErr *APIError
-		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
-			t.Fatalf("error = %v, want 500 *APIError", err)
-		}
-		if apiErr.Code != CodeInternal {
-			t.Fatalf("code = %s, want %s", apiErr.Code, CodeInternal)
+		for target, want := range map[string][]string{
+			"/x?tags=a":        {"a"},
+			"/x?tags=a&tags=b": {"a", "b"},
+		} {
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil)
+			got, err := decodeRequest[req](r, false)
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", target, err)
+			}
+			if !reflect.DeepEqual(got.Tags, want) {
+				t.Fatalf("%s: Tags = %q, want %q", target, got.Tags, want)
+			}
 		}
 	})
+}
+
+// repeatedQueryReq holds a slice query field of every element type a
+// repeated parameter binds.
+type repeatedQueryReq struct {
+	States []string     `json:"-" query:"state"`
+	Limits []int        `json:"-" query:"limit"`
+	IDs    []uuid.UUID  `json:"-" query:"id"`
+	Since  []time.Time  `json:"-" query:"since"`
+	Kinds  []queryState `json:"-" query:"kind"`
+}
+
+// queryState is a named string element of a slice query field.
+type queryState string
+
+func TestDecodeRepeatedQueryParameterFillsASlice(t *testing.T) {
+	const (
+		id1 = "01900000-0000-7000-8000-000000000001"
+		id2 = "01900000-0000-7000-8000-000000000002"
+	)
+	tests := []struct {
+		name   string
+		target string
+		want   repeatedQueryReq
+	}{
+		{
+			name:   "values bind in the order they arrive",
+			target: "/x?state=failed&state=retryable&state=failed",
+			want:   repeatedQueryReq{States: []string{"failed", "retryable", "failed"}},
+		},
+		{
+			name:   "empty values are skipped",
+			target: "/x?state=failed&state=&state=retryable",
+			want:   repeatedQueryReq{States: []string{"failed", "retryable"}},
+		},
+		{name: "an absent parameter leaves the field nil", target: "/x"},
+		{name: "only empty values leave the field nil", target: "/x?state=&state="},
+		{
+			name:   "a comma is part of a value",
+			target: "/x?state=a,b&state=c",
+			want:   repeatedQueryReq{States: []string{"a,b", "c"}},
+		},
+		{
+			name:   "integers",
+			target: "/x?limit=5&limit=-2",
+			want:   repeatedQueryReq{Limits: []int{5, -2}},
+		},
+		{
+			name:   "UUIDs",
+			target: "/x?id=" + id1 + "&id=" + id2,
+			want:   repeatedQueryReq{IDs: []uuid.UUID{uuid.MustParse(id1), uuid.MustParse(id2)}},
+		},
+		{
+			name:   "times and calendar dates",
+			target: "/x?since=2026-05-20T10:00:00Z&since=2026-05-21",
+			want: repeatedQueryReq{Since: []time.Time{
+				time.Date(2026, 5, 20, 10, 0, 0, 0, time.UTC),
+				time.Date(2026, 5, 21, 0, 0, 0, 0, time.UTC),
+			}},
+		},
+		{
+			name:   "a named string element",
+			target: "/x?kind=queued&kind=running",
+			want:   repeatedQueryReq{Kinds: []queryState{"queued", "running"}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.target, nil)
+			got, err := decodeRequest[repeatedQueryReq](r, false)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("a slice parameter replaces the body field it shares", func(t *testing.T) {
+		type req struct {
+			Tags []string `json:"tags" query:"tag"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x?tag=q",
+			strings.NewReader(`{"tags":["b1","b2"]}`))
+		got, err := decodeRequest[req](r, false)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"q"}, got.Tags)
+
+		r = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/x", strings.NewReader(`{"tags":["b1"]}`))
+		got, err = decodeRequest[req](r, false)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"b1"}, got.Tags, "an absent parameter leaves the body's value")
+	})
+
+	t.Run("a slice type that unmarshals itself binds one value", func(t *testing.T) {
+		type req struct {
+			IP net.IP `json:"-" query:"ip"`
+		}
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?ip=10.0.0.1&ip=10.0.0.2", nil)
+		got, err := decodeRequest[req](r, false)
+		require.NoError(t, err)
+		assert.Equal(t, "10.0.0.1", got.IP.String())
+	})
+}
+
+func TestDecodeScalarQueryParameterKeepsTheFirstValue(t *testing.T) {
+	type req struct {
+		State string `json:"-" query:"state"`
+		Limit *int   `json:"-" query:"limit"`
+		Trace string `json:"-" header:"X-Trace-Id"`
+	}
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x?state=a&state=b&limit=3&limit=x", nil)
+	r.Header.Add("X-Trace-Id", "t-1")
+	r.Header.Add("X-Trace-Id", "t-2")
+	got, err := decodeRequest[req](r, false)
+	require.NoError(t, err)
+	assert.Equal(t, "a", got.State)
+	require.NotNil(t, got.Limit)
+	assert.Equal(t, 3, *got.Limit, "a later value is never read, so it cannot fail")
+	assert.Equal(t, "t-1", got.Trace)
+}
+
+func TestDecodeRepeatedQueryParameterNamesTheBadElement(t *testing.T) {
+	tests := []struct {
+		name    string
+		target  string
+		field   string
+		message string
+	}{
+		{"the second value", "/x?limit=5&limit=x", "limit[1]", "must be an integer"},
+		{"the position counts empty values", "/x?limit=&limit=x", "limit[1]", "must be an integer"},
+		{"the first bad value wins", "/x?limit=x&limit=y", "limit[0]", "must be an integer"},
+		{
+			"a UUID element", "/x?id=01900000-0000-7000-8000-000000000001&id=nope",
+			"id[1]", "must be a valid UUID",
+		},
+		{"a time element", "/x?since=&since=&since=yesterday", "since[2]", "must be an RFC3339 timestamp"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.target, nil)
+			_, err := decodeRequest[repeatedQueryReq](r, false)
+			requireParamError(t, err, tc.field, tc.message)
+		})
+	}
+}
+
+// FuzzDecodeRepeatedQuery proves binding a repeated query parameter never
+// panics, that every value which converts is bound in order, and that a value
+// which doesn't is a 422 naming its element.
+func FuzzDecodeRepeatedQuery(f *testing.F) {
+	for _, seed := range [][3]string{
+		{"", "", ""},
+		{"1", "", "a"},
+		{"1", "2", "a"},
+		{"", "7", ""},
+		{"1,2", "3", "a,b"},
+		{"%31", "4", "%zz"},
+		{"1", "x", "b"},
+	} {
+		f.Add(seed[0], seed[1], seed[2])
+	}
+	type req struct {
+		N []int    `json:"-" query:"n"`
+		S []string `json:"-" query:"s"`
+	}
+	f.Fuzz(func(t *testing.T, a, b, c string) {
+		target := "/x?n=" + url.QueryEscape(a) + "&n=" + url.QueryEscape(b) + "&s=" + url.QueryEscape(c)
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil)
+		got, err := decodeRequest[req](r, false) // contract: must not panic
+		if err != nil {
+			requireElementFailure(t, err, "n[0]", "n[1]")
+			return
+		}
+		if want := boundInts(t, a, b); !reflect.DeepEqual(got.N, want) {
+			t.Fatalf("N = %v, want %v", got.N, want)
+		}
+		if c != "" && !reflect.DeepEqual(got.S, []string{c}) {
+			t.Fatalf("S = %q, want [%q]", got.S, c)
+		}
+	})
+}
+
+// requireElementFailure fails unless err is a 422 VALIDATION_ERROR whose every
+// failure names one of the given elements.
+func requireElementFailure(t *testing.T, err error, elements ...string) {
+	t.Helper()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnprocessableEntity || apiErr.Code != CodeValidation {
+		t.Fatalf("error = %v, want a 422 VALIDATION_ERROR", err)
+	}
+	for _, fe := range apiErr.Fields {
+		if !slices.Contains(elements, fe.Field) {
+			t.Fatalf("failure names %q, want one of %q", fe.Field, elements)
+		}
+	}
+}
+
+// boundInts returns the integers a repeated parameter with the given values
+// binds: every non-empty value, in order. It fails when a value doesn't
+// convert, since binding it should have been refused.
+func boundInts(t *testing.T, vals ...string) []int {
+	t.Helper()
+	var out []int
+	for _, v := range vals {
+		if v == "" {
+			continue
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("value %q bound without an error", v)
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 // TestDecodeRequestStrict pins the strict mode enabled by WithStrictDecoding:

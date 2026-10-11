@@ -126,7 +126,9 @@ func buildOperation(sb *schemaBuilder, a anyAction) map[string]any {
 
 // buildParameters builds the path/query/header parameter objects of a request
 // from the same fields the decoder binds (see paramFields). A path parameter is
-// always required; others are required by validate:"required".
+// always required; others are required by validate:"required". A slice query
+// parameter is documented as a repeated parameter, one value each (style form,
+// explode true), the one form the decoder binds.
 func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 	for reqType.Kind() == reflect.Pointer {
 		reqType = reqType.Elem()
@@ -139,12 +141,17 @@ func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 		rules := parseRules(p.field.Tag.Get("validate"), p.field.Type)
 		schema := sb.schemaFor(p.field.Type, modeRequest)
 		applyConstraints(schema, rules)
-		params = append(params, map[string]any{
+		param := map[string]any{
 			"name":     p.name,
 			"in":       p.in,
 			"required": p.in == "path" || hasRequiredRule(rules),
 			"schema":   schema,
-		})
+		}
+		if isSliceParam(p) {
+			param["style"] = "form"
+			param["explode"] = true
+		}
+		params = append(params, param)
 	}
 	return params
 }

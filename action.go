@@ -305,6 +305,11 @@ func structType(t reflect.Type) reflect.Type {
 //     Accepted, 200 otherwise) is not documented by a non-error StatusDoc —
 //     Response[T], whose status is chosen at runtime, is exempt;
 //   - a duplicate ID, or two actions routing the same Method and path;
+//   - a parameter whose type cannot bind: a slice in the path or a header; in
+//     the query, a slice of anything but the scalar types, or a []byte; a
+//     pointer to a slice or to another pointer; a map, an array, an
+//     interface, or a struct other than time.Time or a type whose pointer
+//     implements encoding.TextUnmarshaler;
 //   - two distinct types sharing a component schema name, a type named Error,
 //     or a <Name>Input name already taken (see the schema generator).
 func (r *Registry) Freeze() {
@@ -436,6 +441,10 @@ func (r *Registry) validateActions() {
 			panic(fmt.Sprintf("actions: duplicate route %q (actions %q and %q)", route, other, a.id))
 		}
 		seenRoute[route] = a.id
+
+		if err := checkAction(a.id, a.reqType); err != nil {
+			panic(err.Error())
+		}
 	}
 }
 

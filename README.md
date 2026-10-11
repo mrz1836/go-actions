@@ -120,7 +120,8 @@ misdeclared route fails on boot, not in production. It rejects:
 - a response type whose success status (`204` for `Empty`, `201` for `Created`, `202` for
   `Accepted`, `200` for anything else) is not documented by a non-error `StatusDoc`
   (`Response[T]` is exempt: it picks its status at runtime);
-- a duplicate `ID`, or two actions routing the same method and path; and
+- a duplicate `ID`, or two actions routing the same method and path;
+- a parameter field whose type can't bind (**Request binding** below); and
 - two different types that would share a component schema name, a type named `Error`,
   or a `<Name>Input` name that is already taken.
 
@@ -353,16 +354,25 @@ type GetUserRequest struct {
 | `time.Time` | RFC 3339, or a bare `2006-01-02` date (UTC midnight) | `must be an RFC3339 timestamp` |
 | a type whose pointer implements `encoding.TextUnmarshaler` (`uuid.UUID`, `netip.Addr`, …) | whatever its `UnmarshalText` accepts | `must be a valid UUID` for `uuid.UUID`, otherwise `has an invalid format` |
 | a pointer to any of the above | the same; the field stays `nil` when the parameter is absent | the same |
+| `[]T`, query parameters only, where `T` is any non-pointer type above except a `uint8` kind | each value of the repeated parameter, in order: `?state=failed&state=retryable` | the element's detail, named `<name>[<i>]`: `limit[1]: must be an integer` |
 
 The checks run in that order: `time.Time` first, then `TextUnmarshaler`, then the kind. So
-a named string type with an `UnmarshalText` method binds through that method.
+a named string type with an `UnmarshalText` method binds through that method, and so does
+a slice type with one (`net.IP`): it takes one value, like any scalar.
 
 - **Absent and repeated values:** an empty value counts as absent (`?limit=` leaves the
-  field untouched), and a repeated query parameter or header binds its first value.
+  field untouched). A `[]T` query field binds every value of the repeated parameter, in
+  order, skipping empty ones, and stays `nil` when none arrives. A comma is part of a
+  value, never a separator: `?state=a,b` binds the one element `a,b`. A scalar field binds
+  the first value of a repeated query parameter or header and ignores the rest.
 - **Errors:** a parameter that fails to convert is reported on its own, and validation does
-  not run. Any other field type (a slice, a map, a plain struct) cannot be a parameter: when one
-  receives a value, the request fails with `500 INTERNAL_ERROR`, flagging the declaration
-  mistake.
+  not run. In a `[]T` field, the failure names the element by its position among all the
+  parameter's values, empty ones included, so `?limit=&limit=x` fails as `limit[1]`.
+- **Types that can't bind:** any other parameter type fails at `Freeze()`, with
+  `actions: action "<id>": parameter "<name>": <Go type> cannot be a <path|query|header> parameter`.
+  That covers a slice in the path or a header; in the query, a slice of pointers, slices,
+  maps, or plain structs, and a `[]byte`; a pointer to a slice or to another pointer; a
+  map, an array, an interface, and a plain struct.
 - **Not parameters:** fields inside embedded structs and unexported fields are neither bound
   nor documented as parameters.
 - **Request types:** `Req` may be a struct (including `struct{}`) or a pointer to one, which
@@ -507,7 +517,6 @@ directly, without the mapper. A mapped `Status` of `0` becomes `500`.
 | `422` | `VALIDATION_ERROR` | `validation failed: <field>: <message>; …` | a parameter does not convert, a `validate` rule fails, or `Validate()` reports |
 | `504` | `TIMEOUT` | `request timed out` | the handler returned an error after the request context's deadline passed |
 | `500` | `INTERNAL_ERROR` | `an internal error occurred` | a handler returned a non-`APIError` error (default mapper), or panicked |
-| `500` | `INTERNAL_ERROR` | `unsupported request field type: <kind>` | a parameter field of an unbindable type received a value |
 | `500` | `INTERNAL_ERROR` | `failed to encode response` | the response body failed to marshal (this body carries no `request_id`) |
 | `404` | `NOT_FOUND` | `resource not found` | no route matches (default handler) |
 | `405` | `METHOD_NOT_ALLOWED` | `method not allowed` | the path matches but the method does not (default handler) |
@@ -950,7 +959,10 @@ enforced at runtime, and `required` still lists the field.
   (`Description`, when set), `tags` (`Tags`), `deprecated` (`Deprecated`), and `security`
   (`Security`).
 - `parameters` come from the same fields the decoder binds. A path parameter is always
-  required; the others are required by `validate:"required"`.
+  required; the others are required by `validate:"required"`. A `[]T` query parameter is
+  an array, sent as the parameter repeated once per value, so it is documented with
+  `"style": "form"` and `"explode": true`:
+  `{"name": "state", "in": "query", "required": false, "style": "form", "explode": true, "schema": {"type": "array", "items": {"type": "string"}}}`.
 - `requestBody` appears only for methods with a decoded body and a request with body
   fields. It is `required` exactly when some body field is `validate:"required"`, because
   an absent body decodes as zero values, which fail validation only then.

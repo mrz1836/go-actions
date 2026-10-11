@@ -37,6 +37,10 @@ type paramBinding struct {
 
 	// headerKey is the canonical header key for an "in: header" parameter.
 	headerKey string
+	// slice reports a query parameter that binds every value of the repeated
+	// parameter (see isSliceParam); elem is then the slice's element type.
+	slice bool
+	elem  reflect.Type
 }
 
 // binderCache holds one compiled *requestBinder per request type.
@@ -69,6 +73,9 @@ func newRequestBinder(t reflect.Type) *requestBinder {
 		switch p.in {
 		case "query":
 			b.hasQuery = true
+			if isSliceParam(p) {
+				pb.slice, pb.elem = true, p.field.Type.Elem()
+			}
 		case "header":
 			pb.headerKey = textproto.CanonicalMIMEHeaderKey(p.name)
 		}
@@ -89,9 +96,11 @@ func decodeRequest[Req any](r *http.Request, strict bool) (Req, error) {
 // bind decodes r into dst, an addressable request value. A struct request (or a
 // pointer to one, which is allocated) takes its JSON fields from the body when
 // withBody is set, then its path/query/header fields from the URL and headers;
-// a parameter overrides a body field of the same Go field. An absent or empty
-// parameter leaves the field untouched. A malformed body yields a 400 (see
-// decodeBody); a parameter that cannot be converted yields a 422.
+// a parameter overrides a body field of the same Go field. A scalar parameter
+// binds its first value, and a slice query parameter every value (see
+// setSlice). An absent or empty parameter leaves the field untouched. A
+// malformed body yields a 400 (see decodeBody); a parameter that cannot be
+// converted yields a 422.
 func (b *requestBinder) bind(r *http.Request, dst reflect.Value, withBody, strict bool) error {
 	if !b.isStruct {
 		return nil
@@ -117,22 +126,33 @@ func (b *requestBinder) bind(r *http.Request, dst reflect.Value, withBody, stric
 	}
 	for i := range b.params {
 		p := &b.params[i]
-		var raw string
-		switch p.in {
-		case "path":
-			raw = chi.URLParam(r, p.name)
-		case "query":
-			raw = query.Get(p.name)
-		default:
-			if vals := r.Header[p.headerKey]; len(vals) > 0 {
-				raw = vals[0]
-			}
+		var err error
+		if p.slice {
+			err = setSlice(v.Field(p.index), query[p.name], p.elem, p.name)
+		} else {
+			err = setScalar(v.Field(p.index), p.firstValue(r, query), p.name)
 		}
-		if err := setScalar(v.Field(p.index), raw, p.name); err != nil {
+		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// firstValue returns the scalar parameter's value: the path segment, or the
+// first value of the query parameter or header ("" when absent).
+func (p *paramBinding) firstValue(r *http.Request, query url.Values) string {
+	switch p.in {
+	case "path":
+		return chi.URLParam(r, p.name)
+	case "query":
+		return query.Get(p.name)
+	default:
+		if vals := r.Header[p.headerKey]; len(vals) > 0 {
+			return vals[0]
+		}
+		return ""
+	}
 }
 
 // jsonMediaType is the Content-Type prefix whose request bodies are decoded.
@@ -225,6 +245,41 @@ func parseTimeValue(raw string) (time.Time, error) {
 //nolint:gochecknoglobals // a cached reflect.Type is an intentional package global
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
+// isSliceParam reports whether a parameter binds every value of a repeated
+// query parameter: a query field of slice type, other than a type whose
+// pointer implements encoding.TextUnmarshaler, which binds one value.
+func isSliceParam(p paramField) bool {
+	t := p.field.Type
+	return p.in == "query" && t.Kind() == reflect.Slice && !reflect.PointerTo(t).Implements(textUnmarshalerType)
+}
+
+// setSlice binds the values of a repeated query parameter into the slice field
+// fv, in order, converting each into an element of type elem as setScalar
+// does. An empty value is skipped, but it still counts toward the position i
+// that names a failure "<name>[<i>]", so the name points at the value as the
+// client sent it. A comma is part of a value. The field is set only when some
+// value converted, so an absent or all-empty parameter leaves it untouched.
+func setSlice(fv reflect.Value, vals []string, elem reflect.Type, name string) error {
+	var out reflect.Value
+	for i, raw := range vals {
+		if raw == "" {
+			continue
+		}
+		ev := reflect.New(elem).Elem()
+		if err := setScalar(ev, raw, fmt.Sprintf("%s[%d]", name, i)); err != nil {
+			return err
+		}
+		if !out.IsValid() {
+			out = reflect.MakeSlice(fv.Type(), 0, len(vals))
+		}
+		out = reflect.Append(out, ev)
+	}
+	if out.IsValid() {
+		fv.Set(out)
+	}
+	return nil
+}
+
 // paramError is the 422 for a parameter value that cannot be converted.
 func paramError(name, message string) error {
 	return &APIError{
@@ -294,9 +349,9 @@ func setScalar(fv reflect.Value, raw, name string) error {
 		}
 		fv.SetFloat(n)
 	default:
-		// A path/query/header field of an unbindable kind is a server-side
-		// declaration error, not bad client input. Fail cleanly with a 500
-		// rather than panicking on SetString for a non-string kind.
+		// Freeze refuses a parameter of any other type (see bindable), so a
+		// frozen registry never reaches this case. It stays as a defense: a
+		// declaration error is a 500, never a panic on SetString.
 		return &APIError{
 			Status:  http.StatusInternalServerError,
 			Code:    CodeInternal,

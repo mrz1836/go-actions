@@ -404,6 +404,69 @@ func TestE2E_DateRule(t *testing.T) {
 	})
 }
 
+// filtered echoes the values a list filter bound.
+type filtered struct {
+	States []string `json:"states"`
+	Limits []int    `json:"limits"`
+}
+
+// TestE2E_RepeatedQueryParameters proves, on a served registry, that a slice
+// query parameter receives every value of the repeated parameter, that a bad
+// element is a 422 naming it, and that the contract says how to send the list.
+func TestE2E_RepeatedQueryParameters(t *testing.T) {
+	t.Parallel()
+	reg := actions.NewRegistry()
+	actions.Register(reg, actions.Action[filterReq, filtered]{
+		ID: "test.filter", Method: http.MethodGet, Path: "/filter", Summary: "Filter",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+		Handle: func(_ context.Context, req filterReq) (filtered, error) {
+			return filtered{States: req.States, Limits: req.Limits}, nil
+		},
+	})
+	base := actiontest.NewServer(t, reg).URL
+
+	t.Run("the handler sees every value, in order", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/filter?state=failed&state=&state=retryable&limit=2", "")
+		assert.Equal(t, http.StatusOK, status, body)
+		assert.JSONEq(t, `{"states":["failed","retryable"],"limits":[2]}`, body)
+	})
+
+	t.Run("a bad element is a 422 naming it", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/filter?limit=5&limit=x", "")
+		assert.Equal(t, http.StatusUnprocessableEntity, status)
+		var got map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &got))
+		assert.Equal(t, "validation failed: limit[1]: must be an integer", got["error"])
+		assert.Equal(t, actions.CodeValidation, got["code"])
+	})
+
+	t.Run("the contract documents style and explode", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/openapi.json", "")
+		require.Equal(t, http.StatusOK, status)
+		type parameter struct {
+			Name    string         `json:"name"`
+			Style   string         `json:"style"`
+			Explode bool           `json:"explode"`
+			Schema  map[string]any `json:"schema"`
+		}
+		var doc struct {
+			Paths map[string]map[string]struct {
+				Parameters []parameter `json:"parameters"`
+			} `json:"paths"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(body), &doc))
+		params := doc.Paths["/filter"]["get"].Parameters
+		require.NotEmpty(t, params)
+		assert.Equal(t, "state", params[0].Name)
+		assert.Equal(t, "form", params[0].Style)
+		assert.True(t, params[0].Explode)
+		assert.Equal(t, map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, params[0].Schema)
+	})
+}
+
 // Request and response types for BenchmarkHandler.
 type (
 	benchCreateReq struct {
