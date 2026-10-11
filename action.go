@@ -316,6 +316,9 @@ func structType(t reflect.Type) reflect.Type {
 //     pointer to a slice or to another pointer; a map, an array, an
 //     interface, or a struct other than time.Time or a type whose pointer
 //     implements encoding.TextUnmarshaler;
+//   - a struct type that refers to itself but whose schema would be inlined
+//     (an unexported, generic, or unnamed type), since that schema would
+//     never end;
 //   - two distinct types sharing a component schema name, a type named Error,
 //     or a <Name>Input name already taken (see the schema generator).
 func (r *Registry) Freeze() {

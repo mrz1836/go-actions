@@ -170,12 +170,13 @@ func isByteSlice(t reflect.Type) bool {
 
 // structOrRef emits a struct schema inline, or interns a named struct type into
 // the mode's components and returns a $ref to it. An unnamed, unexported, or
-// generic struct type is inlined.
+// generic struct type is inlined (see inlinesStruct); Freeze refuses one that
+// refers to itself, whose inlined schema would never end.
 func (b *schemaBuilder) structOrRef(t reflect.Type, mode schemaMode) map[string]any {
-	name := t.Name()
-	if name == "" || !isExported(name) || strings.ContainsAny(name, "[]") {
+	if inlinesStruct(t) {
 		return b.structSchema(t, mode)
 	}
+	name := t.Name()
 	b.claimName(name, t)
 	interned := b.response
 	if mode == modeRequest {
@@ -190,6 +191,14 @@ func (b *schemaBuilder) structOrRef(t reflect.Type, mode schemaMode) map[string]
 		b.requestRefs = append(b.requestRefs, refNode{name: name, node: ref})
 	}
 	return ref
+}
+
+// inlinesStruct reports whether the schema generator writes struct type t's
+// schema inline instead of as a component: t is unnamed, unexported, or
+// generic. Only a component can be referred back to, by $ref.
+func inlinesStruct(t reflect.Type) bool {
+	name := t.Name()
+	return name == "" || !isExported(name) || strings.ContainsAny(name, "[]")
 }
 
 // claimName records that type t owns the component name, panicking when a
