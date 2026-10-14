@@ -122,8 +122,10 @@ misdeclared route fails on boot, not in production. It rejects:
   (`Response[T]` is exempt: it picks its status at runtime);
 - a duplicate `ID`, or two actions routing the same method and path;
 - a `validate` rule that is unknown (`omitempty` included), that doesn't apply to its
-  field's type, or whose argument is malformed, on any field of a request or response type
-  ("Rejected rules" under **Validation tags** below);
+  field's type, or whose argument is malformed, on any field of a request or response type;
+  `dive` used twice or on a value that isn't a slice or an array; and any rule but
+  `required` on an enum type ("Rejected rules" under **Validation tags** below);
+- an `EnumValues` method that breaks an enum's rules (**Validation tags** below);
 - a parameter field whose type can't bind (**Request binding** below);
 - a type that refers to itself but would be inlined, because it is unexported or generic
   (**Schema generation** below); and
@@ -139,7 +141,8 @@ The highlights:
 - **Documented auth**: declare OpenAPI `securitySchemes` and per-operation `security` (with `BearerAuth`/`APIKeyAuth` helpers) so the contract states how to authenticate.
 - **Pluggable error mapping**: decouple your domain errors from the wire shape with an `ErrorMapper`.
 - **Self-documenting**: serve `/openapi.json`, `/openapi.yaml`, and a browsable `/_actions` index straight from the registry.
-- **Struct-tag validation, with an escape hatch**: `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, `rfc3339`, and `date`, enforced on nested structs, slices, and maps too, and the same parsed rules become the schema's constraints. A `Validatable` interface covers rules a tag can't express.
+- **Struct-tag validation, with an escape hatch**: `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, `rfc3339`, and `date`, enforced on nested structs, slices, and maps too, with `dive` for rules on each element of a slice, and the same parsed rules become the schema's constraints. A `Validatable` interface covers rules a tag can't express.
+- **Enums on named types**: give a string or integer type an `EnumValues()` method, and its values become one named component in the contract and are checked wherever the type is used, with no tag.
 - **No domain coupling**: the core imports only the standard library, `go-chi/chi/v5`, `google/uuid`, and `gopkg.in/yaml.v3`.
 
 > Why it matters: in 2026, your API contract is consumed by SDK generators, API
@@ -795,6 +798,8 @@ constraints. One parser reads the rules for both sides:
 | `e164` | strings | `+`, a non-zero digit, then 1–14 digits | `pattern: ^\+[1-9]\d{1,14}$` |
 | `rfc3339` | strings | `time.Parse(time.RFC3339, …)` accepts it | `format: date-time` |
 | `date` | strings | a calendar date written `YYYY-MM-DD`: `time.Parse(time.DateOnly, …)` accepts it (so `2026-02-30` fails) and formatting the result gives the input back; a timestamp fails | `format: date` |
+| `dive` | slices and arrays | splits the tag: the rules before it check the collection, and the rules after it check each element as its own type, failing as `<field>[<i>]` | the rules after it become keywords of `items` |
+| an enum type (no tag) | a named string or integer type with `EnumValues()` | equals one of its values, compared as the type, at any depth: `must be one of: a, b` | the type's component, by `$ref` |
 
 - **Rejected rules.** `Freeze()` panics on a rule it can't enforce, so no rule is silently
   dropped. It checks every field of a request or response type, nested fields included, and
@@ -802,12 +807,28 @@ constraints. One parser reads the rules for both sides:
 
   | Case | `Freeze()` panics with |
   | --- | --- |
-  | an unknown rule, `omitempty` and `dive` included | `actions: action "<id>": field "<path>": unknown validate rule "<rule>"` |
-  | a rule on a type it doesn't apply to: `email` on an `int`, `min` on a `bool`, `rfc3339` on a `time.Time`, `oneof` on a slice | `actions: action "<id>": field "<path>": validate rule "<rule>" does not apply to <Go type>` |
-  | a malformed argument: a length bound that isn't a non-negative integer (`min=-1` on a string), a non-finite number, a `oneof` with no values or with a value that doesn't parse as the field's type, or an argument on a rule that takes none (`required=true`) | `actions: action "<id>": field "<path>": validate rule "<rule>" has an invalid argument` |
+  | an unknown rule, `omitempty` included | `actions: action "<id>": field "<path>": unknown validate rule "<rule>"` |
+  | a rule on a type it doesn't apply to: `email` on an `int`, `min` on a `bool`, `rfc3339` on a `time.Time`, `oneof` on a slice, any rule but `required` on an enum type | `actions: action "<id>": field "<path>": validate rule "<rule>" does not apply to <Go type>`, ending `; check elements after dive` on a slice or an array `dive` applies to |
+  | a malformed argument: a length bound that isn't a non-negative integer (`min=-1` on a string), a non-finite number, a `oneof` with no values or with a value that doesn't parse as the field's type, or an argument on a rule that takes none (`required=true`, `dive=1`) | `actions: action "<id>": field "<path>": validate rule "<rule>" has an invalid argument` |
+  | `dive` twice, or on a value that isn't a slice or an array: a `[]byte` (a base64 string) and a type with its own encoding (`uuid.UUID`) count as neither | `actions: action "<id>": field "<path>": dive applies once, to a slice or an array` |
+  | `oneof` on an enum type, whose values are already closed | `actions: action "<id>": field "<path>": validate rule "oneof" does not apply to the enum type <pkg.Type>` |
+  | an `EnumValues` method that breaks an enum's rules (below) | `actions: type <pkg.Type>: EnumValues <reason>` |
 
   A blank segment (`required,,max=3`) carries no rule and is skipped. On a `[]byte`,
   `min`/`max` count bytes at runtime, but the schema (a base64 string) carries no bound.
+- **Elements.** After `dive`, each element is checked as a field of its own type would be,
+  under the zero-value and pointer rules below, and its failure names its position:
+  `tags[1]`, or `state[1]` for a parameter. `required` after `dive` fails an empty element,
+  such as a nil pointer or an empty string, and has no schema keyword.
+- **Enums.** A named string or integer type with `func (T) EnumValues() []T` is an enum.
+  Every value of the type must be one of the values it returns, wherever the type sits (a
+  field, a parameter, a slice element, a map value) and with no tag: the failure lists the
+  raw values, `must be one of: queued, running, failed`, never a `String` method's text. An
+  enum type takes only `required`. `EnumValues` must be declared on the value, return at
+  least one value and none twice, and sit on a type without its own `MarshalJSON` or
+  `MarshalText`; otherwise the reason is `must be func() []<Type> on the value`, `is allowed
+  only on a string or integer type`, `returns no values`, `returns <value> twice`, or `is
+  not allowed on a type that marshals itself`. A struct that embeds an enum isn't one.
 - **Zero values.** Every rule except `required` skips a non-pointer field holding its zero
   value, so `min=1` on an `int` accepts `0`. `required` fails on an empty string, a slice or
   map with no elements, a zero number, `false`, a nil pointer or interface, and a struct or
@@ -817,7 +838,8 @@ constraints. One parser reads the rules for both sides:
   satisfies `required`, and all other rules check its pointee, even a zero one. So a `*int`
   with `min=1` rejects an explicit `0`.
 - **Nesting.** Rules on the fields of nested structs, pointers to structs, slice and array
-  elements, and map values are enforced. Failures name the full path: `address.city`,
+  elements, and map values are enforced, and so is an enum's value check, at any depth.
+  Failures name the full path: `address.city`,
   `items[0].name`, `attrs[color].value`, with map values reported in key order. A type with
   its own JSON or text encoding (`MarshalJSON`, `MarshalText`, `time.Time`) is not
   descended into, matching the schema, which documents it as opaque.
@@ -872,6 +894,21 @@ type (
 // "validation failed: lines[1].sku: is required; lines[1].qty: must be at least 1; notes[gift].qty: must be at least 1"
 ```
 
+```go
+type JobState string
+
+// EnumValues makes JobState an enum, and the JobState component of the contract.
+func (JobState) EnumValues() []JobState { return []JobState{"queued", "running", "failed"} }
+
+type RetryRequest struct {
+	States []JobState `json:"states" validate:"required,max=3"`
+	Tags   []string   `json:"tags"   validate:"max=5,dive,min=2,max=20"`
+}
+
+// {"states":["queued","paused"],"tags":["ok","x"]} → 422
+// "validation failed: states[1]: must be one of: queued, running, failed; tags[1]: must be at least 2 characters"
+```
+
 </details>
 
 <details>
@@ -883,6 +920,12 @@ type (
 - **Named components:** a struct type that is named, exported, and not generic becomes a
   component (`#/components/schemas/User`), referenced by `$ref`. An anonymous, unexported,
   or generic type (`Page[User]`) is inlined, and so is the top-level request body.
+- **Enums:** an enum type (a string or integer type with `EnumValues()`, see **Validation
+  tags**) that is named, exported, and not generic becomes a component too:
+  `{"type": "string", "enum": ["queued", "running", "failed"]}` (`"integer"` for an integer
+  kind), with the values in `EnumValues`' order. Every field, parameter, slice item, and map
+  value of the type references it by `$ref`, and a request and a response share it. Any
+  other enum type is inlined. The rules below apply to its name as to a struct's.
 - **Name collisions:** two different types with the same name (say, from two packages)
   panic at `Freeze`; rename one. `Error` is reserved for the framework's error envelope.
 - **Self-referencing types:** a schema can refer back to a type only by its component's
@@ -915,6 +958,7 @@ schema.
 | `[]byte` | `{"type": "string", "contentEncoding": "base64"}` in 3.1; `{"type": "string", "format": "byte"}` in 3.0 |
 | other slices and arrays, including `[N]byte` | `{"type": "array", "items": …}` |
 | `map[K]V` | `{"type": "object", "additionalProperties": …}` |
+| an enum type (`EnumValues`) | `{"$ref": "#/components/schemas/Name"}`, or its `{"type": …, "enum": […]}` inlined |
 | a named exported struct | `{"$ref": "#/components/schemas/Name"}` |
 | `any`, other interfaces, `func`, `chan` | `{}` |
 | `*T` | `T`'s schema (nullable in responses; see below) |
@@ -985,6 +1029,7 @@ enforced at runtime, and `required` still lists the field.
   an array, sent as the parameter repeated once per value, so it is documented with
   `"style": "form"` and `"explode": true`:
   `{"name": "state", "in": "query", "required": false, "style": "form", "explode": true, "schema": {"type": "array", "items": {"type": "string"}}}`.
+  Its rules after `dive` become keywords of `items`, as a body field's do.
 - `requestBody` appears only for methods with a decoded body and a request with body
   fields. It is `required` exactly when some body field is `validate:"required"`, because
   an absent body decodes as zero values, which fail validation only then.
@@ -1152,20 +1197,24 @@ Medians of `go test -run '^$' -bench . -benchmem -count 6`, measured with Go 1.2
 | `Handler/with_observer` | `create_201` with a `WithObserver` hook | 3,964 | 8,723 | 53 |
 | `DecodeRequest` | decoding a small JSON body (request construction included) | 1,640 | 6,022 | 18 |
 | `DecodeRequest_Params` | binding five path, query, and header parameters | 433 | 513 | 7 |
-| `ValidateRequest` | seven fields covering the whole rule vocabulary | 485 | 104 | 6 |
+| `ValidateRequest` | seven fields covering every tag rule but `dive` | 485 | 104 | 6 |
 | `ValidateRequest_Nested` | a slice of ten structs with rules | 644 | 320 | 1 |
 | `EncodeResponse/created` | encoding a `Created[T]` body | 588 | 1,080 | 12 |
 | `WriteAPIError` | writing a `422` with two field details | 837 | 1,545 | 16 |
 | `Paginate/has_more` | trimming a page and deriving its cursor | 13.8 | 0 | 0 |
 | `ClampLimit/500` | clamping a page size | 2.2 | 0 | 0 |
 | `BuildOpenAPI` | registering and freezing a two-action registry (once per process) | 138,328 | 223,210 | 1,160 |
-| `BuildOpenAPIPetstore` | building and freezing the pet-store registry (once per process) | 183,542 | 249,952 | 1,579 |
+| `BuildOpenAPIPetstore` | building and freezing the pet-store registry (once per process) ¹ | 249,293 | 422,661 | 1,821 |
 
 > The `Handler` and `DecodeRequest` rows include building the `*http.Request` (and, for
 > `Handler`, the response recorder). The per-request hot path is decode, validate, and
 > encode through the typed pipeline.
 > Binding and validation plans are compiled once per request type, so a request does no
 > struct-tag parsing. Contract generation runs once, at `Freeze`.
+
+¹ Measured on 2026-10-13 with Go 1.27.2 on the same machine, after the pet store gained its
+repeated `tag` filter and the `PetTag` enum. Most of the growth is encoding the larger
+document as YAML.
 
 <br/>
 
