@@ -1,14 +1,16 @@
 package actions
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 )
 
-// declError is one declaration problem, which Freeze panics with.
+// declError is one declaration problem, which Freeze panics with and SchemaFor
+// and Validate return.
 type declError struct {
-	subject string // `action "<id>"`, or `type <pkg.Type>` for an EnumValues method
-	detail  string // `field "<path>": …`, `parameter "<name>": …`, or `EnumValues …`
+	subject string // `action "<id>"`, or `type <pkg.Type>`
+	detail  string // `field "<path>": …`, `parameter "<name>": …`, `EnumValues …`, or `types …`
 }
 
 // Error renders the problem as Freeze reports it.
@@ -19,26 +21,14 @@ func (e *declError) Error() string { return "actions: " + e.subject + ": " + e.d
 // fields, each depth first in field order. It reads every field the decoder
 // binds, the validator checks, or the schema generator documents, and so
 // refuses a parameter the decoder cannot bind, a validate rule that would
-// otherwise be dropped (see parseRules), an EnumValues method that breaks the
-// rules (see enumOf), and a type that refers to itself but whose schema would
-// be inlined into itself (see structFields).
+// otherwise be dropped (see parseRules), an example its field's rules refuse
+// (see checkExample), an EnumValues method that breaks the rules (see enumOf),
+// and a type that refers to itself but whose schema would be inlined into
+// itself (see structFields).
 func checkAction(id string, reqType, respType reflect.Type) error {
-	c := &declChecker{
-		subject:  fmt.Sprintf("action %q", id),
-		seen:     map[reflect.Type]bool{},
-		inlining: map[reflect.Type]bool{},
-	}
+	c := newDeclChecker(fmt.Sprintf("action %q", id))
 	if st := structType(reqType); st != nil {
-		// The request body's schema is always inlined, but a field of its own
-		// type gets the component's $ref when the type is one.
-		c.seen[st] = true
-		if inlinesStruct(st) {
-			c.inlining[st] = true
-		}
-		if err := c.params(st); err != nil {
-			return err
-		}
-		if err := c.fields(st, ""); err != nil {
+		if err := c.request(st); err != nil {
 			return err
 		}
 	}
@@ -49,7 +39,20 @@ func checkAction(id string, reqType, respType reflect.Type) error {
 	return nil
 }
 
-// declChecker walks one action's types for checkAction.
+// checkRequest is checkAction's request half, for a type read as a request
+// outside a registry (SchemaFor and Validate): a struct, or a pointer to one,
+// is checked as a request type, its parameters and then its body fields; any
+// other type as a value. subject names the type in the error.
+func checkRequest(subject string, t reflect.Type) error {
+	c := newDeclChecker(subject)
+	if st := structType(t); st != nil {
+		return c.request(st)
+	}
+	return c.value(t, "")
+}
+
+// declChecker walks one action's types for checkAction, or one type's for
+// checkRequest.
 type declChecker struct {
 	subject string
 	// seen holds the types already walked, which ends recursion: a field's
@@ -60,14 +63,39 @@ type declChecker struct {
 	inlining map[reflect.Type]bool
 }
 
+// newDeclChecker returns a checker whose errors name subject.
+func newDeclChecker(subject string) *declChecker {
+	return &declChecker{
+		subject:  subject,
+		seen:     map[reflect.Type]bool{},
+		inlining: map[reflect.Type]bool{},
+	}
+}
+
 // fail returns the declaration error for detail.
 func (c *declChecker) fail(detail string) error {
 	return &declError{subject: c.subject, detail: detail}
 }
 
+// request checks request struct type t: its parameter fields, then its body
+// fields.
+func (c *declChecker) request(t reflect.Type) error {
+	// The request body's schema is always inlined, but a field of its own
+	// type gets the component's $ref when the type is one.
+	c.seen[t] = true
+	if inlinesStruct(t) {
+		c.inlining[t] = true
+	}
+	if err := c.params(t); err != nil {
+		return err
+	}
+	return c.fields(t, "")
+}
+
 // params checks the parameter fields of request struct t: that each type can
 // bind from its location, then its validate rules, under the parameter's name,
-// then the EnumValues method of its type and of a slice's element type.
+// then the EnumValues method of its type and of a slice's element type, then
+// its example.
 func (c *declChecker) params(t reflect.Type) error {
 	for _, p := range paramFields(t) {
 		if !bindable(p.field.Type, p.in) {
@@ -84,12 +112,16 @@ func (c *declChecker) params(t reflect.Type) error {
 				return err
 			}
 		}
+		if reason := checkExample(p.field); reason != "" {
+			return c.fail(fmt.Sprintf("field %q: example %s", p.name, reason))
+		}
 	}
 	return nil
 }
 
 // fields checks the validate rules of struct t's JSON fields, then descends
-// into each field's value. prefix is the path of t's value ("" at the top).
+// into each field's value, then checks the field's example against rules the
+// walk has accepted. prefix is the path of t's value ("" at the top).
 func (c *declChecker) fields(t reflect.Type, prefix string) error {
 	for _, jf := range jsonFields(t) {
 		path := jf.name
@@ -102,8 +134,63 @@ func (c *declChecker) fields(t reflect.Type, prefix string) error {
 		if err := c.value(jf.field.Type, path); err != nil {
 			return err
 		}
+		if reason := checkExample(jf.field); reason != "" {
+			return c.fail(fmt.Sprintf("field %q: example %s", path, reason))
+		}
 	}
 	return nil
+}
+
+// checkExample returns why field f's example tag fails the field, or "" when
+// it passes or is empty: the example must decode into the field's type, read
+// as the schema reads it (see exampleValue), and then pass every check a
+// request value there gets, its validate rules, the rules after dive, its
+// enum, and those of the types it holds. The reason is "does not decode into
+// <Go type>", or the first failure's message, after its path within the value
+// when it has one ("zip: must be at most 5 characters").
+func checkExample(f reflect.StructField) string {
+	tag := f.Tag.Get("example")
+	if tag == "" {
+		return ""
+	}
+	value, ok := decodeExample(f.Type, tag)
+	if !ok {
+		return "does not decode into " + f.Type.String()
+	}
+	c := &validatorCompiler{nodes: map[reflect.Type]*vnode{}}
+	vf := c.field("", nil, f)
+	c.resolveLiveness()
+	var w walker
+	checkRules(&w, value, true, vf.rules, vf.required, noParent, "")
+	if v, present := deref(value); present && vf.sub != nil {
+		vf.sub.check(&w, v, noParent, &vf)
+	}
+	if len(w.errs) == 0 {
+		return ""
+	}
+	first := w.errs[0]
+	if first.Field == "" {
+		return first.Message
+	}
+	return first.Field + ": " + first.Message
+}
+
+// decodeExample decodes an example tag into a new value of type t, reporting
+// false when it does not decode.
+func decodeExample(t reflect.Type, tag string) (reflect.Value, bool) {
+	example, ok := exampleValue(t, tag)
+	if !ok {
+		return reflect.Value{}, false
+	}
+	data, err := json.Marshal(example)
+	if err != nil {
+		return reflect.Value{}, false
+	}
+	ptr := reflect.New(t)
+	if json.Unmarshal(data, ptr.Interface()) != nil {
+		return reflect.Value{}, false
+	}
+	return ptr.Elem(), true
 }
 
 // value descends into a value of type t (pointers followed) at path: a

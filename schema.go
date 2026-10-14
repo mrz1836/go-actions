@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,10 @@ const typeString = "string"
 
 // componentRefPrefix is the JSON pointer prefix of a named component schema.
 const componentRefPrefix = "#/components/schemas/"
+
+// defsRefPrefix is the JSON pointer prefix of a schema in a standalone
+// document's $defs.
+const defsRefPrefix = "#/$defs/"
 
 // inputSuffix names the request variant of a component whose request and
 // response schemas differ.
@@ -85,6 +90,13 @@ type schemaBuilder struct {
 	// requestRefs are the $ref nodes emitted in request mode, which components
 	// retargets to <Name>Input when that name's schemas differ.
 	requestRefs []refNode
+
+	// standalone selects SchemaFor's self-contained document: every named
+	// type is inlined, except the types in cyclic, whose schemas go once in
+	// defs and are referenced as #/$defs/<Name>. No component is interned.
+	standalone bool
+	cyclic     map[reflect.Type]bool
+	defs       map[string]map[string]any
 }
 
 // refNode is one emitted $ref object and the component name it points to.
@@ -175,9 +187,13 @@ func isByteSlice(t reflect.Type) bool {
 // structOrRef emits a struct schema inline, or interns a named struct type into
 // the mode's components and returns a $ref to it. An unnamed, unexported, or
 // generic struct type is inlined (see inlinesStruct); Freeze refuses one that
-// refers to itself, whose inlined schema would never end.
+// refers to itself, whose inlined schema would never end. A standalone builder
+// inlines every struct type but those on a cycle (see defsRef).
 func (b *schemaBuilder) structOrRef(t reflect.Type, mode schemaMode) map[string]any {
-	if inlinesStruct(t) {
+	if b.standalone && b.cyclic[t] {
+		return b.defsRef(t, mode)
+	}
+	if b.standalone || inlinesStruct(t) {
 		return b.structSchema(t, mode)
 	}
 	name := t.Name()
@@ -197,14 +213,27 @@ func (b *schemaBuilder) structOrRef(t reflect.Type, mode schemaMode) map[string]
 	return ref
 }
 
+// defsRef puts struct type t's schema in the standalone document's $defs, once,
+// and returns a $ref to it. SchemaFor has checked that no two such types share
+// a name.
+func (b *schemaBuilder) defsRef(t reflect.Type, mode schemaMode) map[string]any {
+	name := t.Name()
+	if _, seen := b.defs[name]; !seen {
+		b.defs[name] = map[string]any{} // placeholder breaks recursion
+		b.defs[name] = b.structSchema(t, mode)
+	}
+	return map[string]any{"$ref": defsRefPrefix + name}
+}
+
 // enumSchema returns enum type t's schema, {"type": "string" | "integer",
 // "enum": [...]} with the values in EnumValues' order. Like a struct, a named,
 // exported, non-generic enum type is interned into the mode's components and
-// referenced by $ref, and any other is inlined (see inlinesStruct). Its schema
-// is the same in both modes, so a request and a response share one component.
+// referenced by $ref, and any other is inlined (see inlinesStruct); a
+// standalone builder inlines every one. Its schema is the same in both modes,
+// so a request and a response share one component.
 func (b *schemaBuilder) enumSchema(t reflect.Type, spec *enumSpec, mode schemaMode) map[string]any {
 	schema := map[string]any{schemaTypeKey: shapeType(shapeOf(t)), "enum": slices.Clone(spec.values)}
-	if inlinesStruct(t) {
+	if b.standalone || inlinesStruct(t) {
 		return schema
 	}
 	name := t.Name()
@@ -274,7 +303,8 @@ func (b *schemaBuilder) structSchema(t reflect.Type, mode schemaMode) map[string
 // fieldSchema returns one struct field's schema: the openapi tag's override, or
 // the field type's schema with its validate constraints applied. A pointer the
 // encoder writes whenever the field is present (written) is made nullable,
-// since nil encodes as null.
+// since nil encodes as null. The field's doc and example tags come last (see
+// annotate).
 func (b *schemaBuilder) fieldSchema(f reflect.StructField, rules ruleSet, written bool, mode schemaMode) map[string]any {
 	schema, overridden := openapiOverride(f.Tag.Get("openapi"))
 	if !overridden {
@@ -284,7 +314,70 @@ func (b *schemaBuilder) fieldSchema(f reflect.StructField, rules ruleSet, writte
 	if written && f.Type.Kind() == reflect.Pointer {
 		schema = b.nullable(schema)
 	}
+	return b.annotate(schema, f)
+}
+
+// annotate adds field f's doc tag to its schema as the description, and its
+// example tag (see exampleValue) as "examples": [v], or, in the OpenAPI 3.0
+// dialect, "example": v. An empty tag writes nothing. A bare $ref takes the
+// keywords beside it, except in 3.0, which ignores a $ref's siblings, so there
+// it is wrapped once in allOf; a nullable wrapper takes them on itself.
+func (b *schemaBuilder) annotate(schema map[string]any, f reflect.StructField) map[string]any {
+	doc := f.Tag.Get("doc")
+	example, hasExample := exampleValue(f.Type, f.Tag.Get("example"))
+	if doc == "" && !hasExample {
+		return schema
+	}
+	if _, isRef := schema["$ref"]; isRef && b.openAPI30 {
+		schema = map[string]any{"allOf": []any{schema}}
+	}
+	if doc != "" {
+		schema["description"] = doc
+	}
+	if hasExample && b.openAPI30 {
+		schema["example"] = example
+	} else if hasExample {
+		schema["examples"] = []any{example}
+	}
 	return schema
+}
+
+// exampleValue reads an example tag for a value of type t, the same way for
+// the schema and for the check Freeze runs on it (see checkExample). When t
+// (pointers followed) encodes as a JSON string — a string kind, enums
+// included, a time.Time, a type that marshals itself as text, or a []byte —
+// the tag is that string, as written; otherwise it is JSON, kept compacted as
+// written, so a large number keeps its precision. It reports false for an
+// empty tag, and for one that should be JSON but isn't.
+func exampleValue(t reflect.Type, tag string) (any, bool) {
+	if tag == "" {
+		return nil, false
+	}
+	if encodesAsString(derefType(t)) {
+		return tag, true
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, []byte(tag)) != nil {
+		return nil, false
+	}
+	return json.RawMessage(compact.Bytes()), true
+}
+
+// encodesAsString reports whether encoding/json writes a value of type t as a
+// JSON string, in schemaFor's precedence: a time.Time does; a type with its own
+// MarshalJSON writes what it likes, so it is read as JSON; a type with its own
+// MarshalText, a []byte, and a string kind do.
+func encodesAsString(t reflect.Type) bool {
+	switch {
+	case t == timeType:
+		return true
+	case implements(t, jsonMarshalerType):
+		return false
+	case implements(t, textMarshalerType), isByteSlice(t):
+		return true
+	default:
+		return t.Kind() == reflect.String
+	}
 }
 
 // nullable widens a schema to also admit null: OpenAPI 3.1 adds a "null" type

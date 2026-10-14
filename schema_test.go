@@ -995,3 +995,123 @@ func TestSchemaDateFormat(t *testing.T) {
 		}
 	})
 }
+
+// Fixtures for the doc and example tags.
+type (
+	// DocAddress is exported, so a field of its type is a $ref. Its one
+	// field is optional, so its request and response schemas agree.
+	DocAddress struct {
+		City string `json:"city,omitempty"`
+	}
+	// docReq documents a parameter and body fields, plain and by reference.
+	docReq struct {
+		Limit   int        `json:"-" query:"limit" doc:"Page size" validate:"min=1,max=200"`
+		Name    string     `json:"name" doc:"Display name"`
+		Address DocAddress `json:"address" doc:"Where to deliver"`
+		State   EnumState  `json:"state" doc:"The current state"`
+		Plain   string     `json:"plain" doc:""`
+	}
+	// DocView documents response pointers, whose schemas are nullable.
+	DocView struct {
+		Nick    *string     `json:"nick" doc:"Nickname"`
+		Address *DocAddress `json:"address" doc:"Where it was delivered"`
+	}
+	// exampleReq gives examples to a parameter, a slice parameter, and body
+	// fields, plain and by reference.
+	exampleReq struct {
+		Limit  int         `json:"-" query:"limit" example:"25" validate:"min=1,max=200"`
+		States []EnumState `json:"-" query:"state" example:"[\"failed\",\"queued\"]"`
+		Name   string      `json:"name" example:"Ada"`
+		Count  int         `json:"count" example:"25"`
+		Tags   []string    `json:"tags" example:"[\"a\",\"b\"]"`
+		State  EnumState   `json:"state" example:"queued"`
+		Plain  string      `json:"plain" example:""`
+	}
+)
+
+func TestDocTagBecomesTheDescription(t *testing.T) {
+	const (
+		addressRef = `{"$ref":"#/components/schemas/DocAddress"}`
+		stateRef   = `{"$ref":"#/components/schemas/EnumState"}`
+	)
+	for _, tc := range []struct {
+		version, address, state, nick, nullableAddress string
+	}{
+		{
+			version:         "3.1.0",
+			address:         `{"$ref":"#/components/schemas/DocAddress","description":"Where to deliver"}`,
+			state:           `{"$ref":"#/components/schemas/EnumState","description":"The current state"}`,
+			nick:            `{"type":["string","null"],"description":"Nickname"}`,
+			nullableAddress: `{"oneOf":[` + addressRef + `,{"type":"null"}],"description":"Where it was delivered"}`,
+		},
+		{
+			version:         "3.0.3",
+			address:         `{"allOf":[` + addressRef + `],"description":"Where to deliver"}`,
+			state:           `{"allOf":[` + stateRef + `],"description":"The current state"}`,
+			nick:            `{"type":"string","nullable":true,"description":"Nickname"}`,
+			nullableAddress: `{"allOf":[` + addressRef + `],"nullable":true,"description":"Where it was delivered"}`,
+		},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			doc := contractFor[docReq, DocView](t, WithOpenAPIVersion(tc.version))
+
+			assert.Equal(t, "Page size", parameterOf(t, doc, "limit")["description"], "a parameter's description")
+			body := requestBodyOf(t, doc)
+			assert.JSONEq(t, `{"type":"string","description":"Display name"}`,
+				jsonOf(t, propertyOf(t, body, "name")), "a body field's description")
+			assert.JSONEq(t, tc.address, jsonOf(t, propertyOf(t, body, "address")),
+				"a reference to a struct component carries the description")
+			assert.JSONEq(t, tc.state, jsonOf(t, propertyOf(t, body, "state")),
+				"a reference to an enum component carries the description")
+			assert.JSONEq(t, `{"type":"string"}`, jsonOf(t, propertyOf(t, body, "plain")),
+				"an empty doc tag writes nothing")
+			assert.JSONEq(t, `{"type":"object","properties":{"city":{"type":"string"}}}`,
+				jsonOf(t, component(t, doc, "DocAddress")), "the component itself has no description")
+
+			view := component(t, doc, "DocView")
+			assert.JSONEq(t, tc.nick, jsonOf(t, propertyOf(t, view, "nick")),
+				"a nullable field carries the description")
+			assert.JSONEq(t, tc.nullableAddress, jsonOf(t, propertyOf(t, view, "address")),
+				"a nullable reference carries it on its wrapper")
+		})
+	}
+}
+
+func TestExampleTagBecomesTheExample(t *testing.T) {
+	const stateRef = `{"$ref":"#/components/schemas/EnumState"}`
+	for _, tc := range []struct {
+		version, name, count, tags, state string
+	}{
+		{
+			version: "3.1.0",
+			name:    `{"type":"string","examples":["Ada"]}`,
+			count:   `{"type":"integer","examples":[25]}`,
+			tags:    `{"type":"array","items":{"type":"string"},"examples":[["a","b"]]}`,
+			state:   `{"$ref":"#/components/schemas/EnumState","examples":["queued"]}`,
+		},
+		{
+			version: "3.0.3",
+			name:    `{"type":"string","example":"Ada"}`,
+			count:   `{"type":"integer","example":25}`,
+			tags:    `{"type":"array","items":{"type":"string"},"example":["a","b"]}`,
+			state:   `{"allOf":[` + stateRef + `],"example":"queued"}`,
+		},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			doc := contractFor[exampleReq, Empty](t, WithOpenAPIVersion(tc.version))
+
+			assert.JSONEq(t, `25`, jsonOf(t, parameterOf(t, doc, "limit")["example"]),
+				"a parameter's example is parsed as JSON")
+			assert.JSONEq(t, `["failed","queued"]`, jsonOf(t, parameterOf(t, doc, "state")["example"]),
+				"a slice parameter's example is its JSON array")
+			body := requestBodyOf(t, doc)
+			assert.JSONEq(t, tc.name, jsonOf(t, propertyOf(t, body, "name")), "a string's example is taken as is")
+			assert.JSONEq(t, tc.count, jsonOf(t, propertyOf(t, body, "count")), "an integer's example is parsed")
+			assert.JSONEq(t, tc.tags, jsonOf(t, propertyOf(t, body, "tags")), "a slice's example is its JSON array")
+			assert.JSONEq(t, tc.state, jsonOf(t, propertyOf(t, body, "state")),
+				"a reference to an enum component carries the example")
+			assert.JSONEq(t, `{"type":"string"}`, jsonOf(t, propertyOf(t, body, "plain")),
+				"an empty example tag writes nothing")
+		})
+	}
+}

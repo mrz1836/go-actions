@@ -128,7 +128,9 @@ func buildOperation(sb *schemaBuilder, a anyAction) map[string]any {
 // from the same fields the decoder binds (see paramFields). A path parameter is
 // always required; others are required by validate:"required". A slice query
 // parameter is documented as a repeated parameter, one value each (style form,
-// explode true), the one form the decoder binds.
+// explode true), the one form the decoder binds. A field's doc tag becomes the
+// parameter's description, and its example tag (see exampleValue) its
+// example, in both dialects.
 func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 	for reqType.Kind() == reflect.Pointer {
 		reqType = reqType.Elem()
@@ -151,6 +153,12 @@ func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 		if isSliceParam(p) {
 			param["style"] = "form"
 			param["explode"] = true
+		}
+		if doc := p.field.Tag.Get("doc"); doc != "" {
+			param["description"] = doc
+		}
+		if example, ok := exampleValue(p.field.Type, p.field.Tag.Get("example")); ok {
+			param["example"] = example
 		}
 		params = append(params, param)
 	}
