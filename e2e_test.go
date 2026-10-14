@@ -611,3 +611,76 @@ func BenchmarkHandler(b *testing.B) {
 		})
 	}
 }
+
+// headView is the body a HEAD action's handler returns, which its response
+// never carries.
+type headView struct {
+	Size int `json:"size"`
+}
+
+// headAction declares a HEAD action at path whose handler is handle.
+func headAction(id, path string, handle func(context.Context, struct{}) (headView, error)) actions.Action[struct{}, headView] {
+	return actions.Action[struct{}, headView]{
+		ID:      id,
+		Method:  http.MethodHead,
+		Path:    path,
+		Summary: "Head " + path,
+		Statuses: []actions.StatusDoc{
+			{Code: http.StatusOK, Description: "ok"},
+			{Code: http.StatusNotFound, Description: "gone", Error: true},
+		},
+		Handle: handle,
+	}
+}
+
+// TestHeadRequestGetsHeadersAndNoBody drives the registry's handler directly:
+// a net/http server drops a HEAD response's body on its own, while a recorder,
+// a buffering middleware, or an adapter that turns the response into a
+// serverless function's reply keeps whatever the handler wrote.
+func TestHeadRequestGetsHeadersAndNoBody(t *testing.T) {
+	reg := actions.NewRegistry()
+	actions.Register(reg, headAction("file.head", "/file", func(context.Context, struct{}) (headView, error) {
+		return headView{Size: 42}, nil
+	}))
+	actions.Register(reg, headAction("gone.head", "/gone", func(context.Context, struct{}) (headView, error) {
+		return headView{}, &actions.APIError{Status: http.StatusNotFound, Code: actions.CodeNotFound, Message: "gone"}
+	}))
+	actions.Register(reg, headAction("boom.head", "/boom", func(context.Context, struct{}) (headView, error) {
+		panic("boom")
+	}))
+	actions.Register(reg, echoAction()) // GET /echo
+	reg.Freeze()
+	handler := reg.Handler()
+
+	serve := func(t *testing.T, method, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), method, target, nil))
+		return rec
+	}
+	for _, tc := range []struct {
+		name   string
+		target string
+		status int
+	}{
+		{"a HEAD action's response", "/file", http.StatusOK},
+		{"a HEAD to a path only GET serves", "/echo", http.StatusMethodNotAllowed},
+		{"a HEAD action's error", "/gone", http.StatusNotFound},
+		{"a HEAD action that panics", "/boom", http.StatusInternalServerError},
+		{"a HEAD to a path nothing serves", "/nowhere", http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serve(t, http.MethodHead, tc.target)
+			assert.Equal(t, tc.status, rec.Code)
+			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"), "the headers arrive")
+			assert.NotEmpty(t, rec.Header().Get("X-Request-ID"), "the headers arrive")
+			assert.Empty(t, rec.Body.String(), "no body")
+		})
+	}
+
+	t.Run("a GET keeps its body", func(t *testing.T) {
+		rec := serve(t, http.MethodGet, "/echo?msg=hi")
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.JSONEq(t, `{"greeting":"echo hi"}`, rec.Body.String())
+	})
+}

@@ -174,6 +174,33 @@ func (r *Registry) maxBytesMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// headBody serves a HEAD request with a writer that discards the body, so
+// every response written to one (an action's, an error's, a 404 or 405, a
+// recovered panic's) carries its status and headers alone, as net/http's own
+// server sends it. An adapter that turns the response into a serverless
+// function's reply, a buffering middleware, or a test recorder would
+// otherwise keep the body. Other methods pass through untouched.
+func headBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodHead {
+			w = &headWriter{ResponseWriter: w}
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+// headWriter is a HEAD response's writer: Write reports every byte written and
+// discards it, as net/http does for a HEAD request.
+type headWriter struct {
+	http.ResponseWriter
+}
+
+// Write discards p.
+func (h *headWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// Unwrap returns the wrapped ResponseWriter, for http.ResponseController.
+func (h *headWriter) Unwrap() http.ResponseWriter { return h.ResponseWriter }
+
 // statusRecorder wraps a ResponseWriter to capture the status code written, for
 // observability. Defaults to 200 when the handler writes a body without an
 // explicit WriteHeader.

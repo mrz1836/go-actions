@@ -125,6 +125,8 @@ misdeclared route fails on boot, not in production. It rejects:
   field's type, or whose argument is malformed, on any field of a request or response type;
   `dive` used twice or on a value that isn't a slice or an array; and any rule but
   `required` on an enum type ("Rejected rules" under **Validation tags** below);
+- an `example` tag that doesn't decode into its field's type, or that the field's own
+  rules refuse (**Schema generation** below);
 - an `EnumValues` method that breaks an enum's rules (**Validation tags** below);
 - a parameter field whose type can't bind (**Request binding** below);
 - a type that refers to itself but would be inlined, because it is unexported or generic
@@ -143,6 +145,8 @@ The highlights:
 - **Self-documenting**: serve `/openapi.json`, `/openapi.yaml`, and a browsable `/_actions` index straight from the registry.
 - **Struct-tag validation, with an escape hatch**: `required`, `min`, `max`, `oneof`, `uuid`, `email`, `e164`, `rfc3339`, and `date`, enforced on nested structs, slices, and maps too, with `dive` for rules on each element of a slice, and the same parsed rules become the schema's constraints. A `Validatable` interface covers rules a tag can't express.
 - **Enums on named types**: give a string or integer type an `EnumValues()` method, and its values become one named component in the contract and are checked wherever the type is used, with no tag.
+- **Described fields**: a `doc` tag becomes a field's or a parameter's description, and an `example` tag its example, which `Freeze` checks against the field's own rules.
+- **Schemas and validation outside HTTP**: `SchemaFor[T]()` returns a self-contained JSON Schema for a payload type, and `Validate(v)` runs the checks a request would, so a queued job's arguments or a stored setting share the contract's rules.
 - **No domain coupling**: the core imports only the standard library, `go-chi/chi/v5`, `google/uuid`, and `gopkg.in/yaml.v3`.
 
 > Why it matters: in 2026, your API contract is consumed by SDK generators, API
@@ -407,6 +411,13 @@ response is a `500` with the fixed body
 content, so it is written with its status and headers only: no body, and no
 `Content-Type`, `Content-Length`, or `Transfer-Encoding`, even when a handler or a
 middleware set one. That holds for error responses too.
+
+A `HEAD` request gets its status and headers and no body, whatever writes the response:
+an action declared with method `HEAD`, an error, the `404` and `405` handlers (a `HEAD`
+to a path only `GET` serves is a `405`), a recovered panic, or your own middleware.
+`Handler()` drops the body outside every layer, as `net/http`'s own server does, so an
+adapter that turns the response into a serverless function's reply, a buffering
+middleware, or a test recorder sees no body either.
 
 For headers such as `Cache-Control` or `ETag`, return a `Response[T]`; its `Header` is
 added to the response before the body is written:
@@ -1019,6 +1030,38 @@ The override replaces the generated schema with
 TypeScript). The field's `validate` constraints are not documented, but they are still
 enforced at runtime, and `required` still lists the field.
 
+**Descriptions and examples.** A `doc` tag becomes a field's `description`, and an
+`example` tag its example:
+
+```go
+type CreateUserRequest struct {
+	Name string `json:"name" doc:"Display name" example:"Ada" validate:"required,max=100"`
+	Age  int    `json:"age" doc:"Age in years" example:"36" validate:"min=0"`
+	Team Team   `json:"team" doc:"The team the user joins" example:"{\"id\":\"t_1\"}"`
+}
+```
+
+- **The value:** an example is taken as written for a type that encodes as a JSON string (a
+  string, a string enum, `time.Time`, `uuid.UUID` and other `MarshalText` types, `[]byte`),
+  and parsed as JSON for any other (`example:"36"`, `example:"true"`,
+  `example:"[\"failed\",\"queued\"]"`).
+- **The keyword:** in 3.1 a field gets `"examples": [<value>]`, and in 3.0 `"example": <value>`,
+  so `name` is `{"type": "string", "maxLength": 100, "description": "Display name", "examples": ["Ada"]}`
+  in 3.1.
+- **A `$ref`:** in 3.1 the keywords sit beside it:
+  `{"$ref": "#/components/schemas/Team", "description": "The team the user joins", "examples": [{"id": "t_1"}]}`.
+  OpenAPI 3.0 ignores a `$ref`'s siblings, so there the field is wrapped once:
+  `{"allOf": [{"$ref": "#/components/schemas/Team"}], "description": "The team the user joins", "example": {"id": "t_1"}}`.
+  A nullable response field carries them on its `oneOf` or `allOf` wrapper, and the component
+  itself takes no description from a field.
+- An empty tag writes nothing.
+- **Checked at `Freeze`:** each example is decoded into its field's type and put through the
+  field's checks (its `validate` rules, its rules after `dive`, its enum, and those of the
+  types it holds), on parameters and on every field of a request or response type. One that
+  fails panics with `actions: action "<id>": field "<path>": example <reason>`, where the
+  reason is `does not decode into <Go type>` or the failure's message (`must be at most 200`,
+  or `zip: must be at most 5 characters` for a value inside the example).
+
 **Operations.** Each action becomes one operation:
 
 - `operationId` comes from `ID`, alongside `summary` (`Summary`), `description`
@@ -1029,13 +1072,108 @@ enforced at runtime, and `required` still lists the field.
   an array, sent as the parameter repeated once per value, so it is documented with
   `"style": "form"` and `"explode": true`:
   `{"name": "state", "in": "query", "required": false, "style": "form", "explode": true, "schema": {"type": "array", "items": {"type": "string"}}}`.
-  Its rules after `dive` become keywords of `items`, as a body field's do.
+  Its rules after `dive` become keywords of `items`, as a body field's do. A parameter's
+  `doc` and `example` tags become the Parameter Object's `description` and `example`, in
+  both dialects.
 - `requestBody` appears only for methods with a decoded body and a request with body
   fields. It is `required` exactly when some body field is `validate:"required"`, because
   an absent body decodes as zero values, which fail validation only then.
 - Each `StatusDoc` becomes a response. An `Error: true` status references the `Error`
   component, and any other status carries the `Resp` body schema (none for `Empty`).
   `Description` defaults to the status text.
+
+</details>
+
+<details>
+<summary><strong><code>Schemas and validation outside a registry</code></strong></summary>
+<br/>
+
+A payload that never arrives as a request body, such as a queued job's arguments or a
+stored setting, can share the contract's schema and rules, from the same struct tags, so a
+form and the server can't disagree.
+
+```go
+type Priority int
+
+func (Priority) EnumValues() []Priority { return []Priority{1, 5, 10} }
+
+type Address struct {
+	City string `json:"city" validate:"required"`
+}
+
+type SendReport struct {
+	Recipients []string `json:"recipients" doc:"Who gets the report" example:"[\"ada@example.com\"]" validate:"required,max=10,dive,email"`
+	Priority   Priority `json:"priority"`
+	ReplyTo    *Address `json:"reply_to,omitempty"`
+}
+```
+
+**`actions.SchemaFor[T]()`** returns one self-contained JSON Schema 2020-12 document for
+`T`, read as a request body: the schema a registry publishes for a request body of type
+`T`, with `"$schema"` set and every component written in place. `SchemaFor[SendReport]()`
+returns:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "recipients": {
+      "type": "array",
+      "items": {"type": "string", "format": "email"},
+      "maxItems": 10,
+      "description": "Who gets the report",
+      "examples": [["ada@example.com"]]
+    },
+    "priority": {"type": "integer", "enum": [1, 5, 10]},
+    "reply_to": {
+      "type": "object",
+      "properties": {"city": {"type": "string"}},
+      "required": ["city"]
+    }
+  },
+  "required": ["recipients"]
+}
+```
+
+- It carries what a request's schema does: `required` from `validate:"required"`
+  (pointers aren't nullable), the `validate` constraints, enums, the rules after `dive`, and
+  `doc` and `example`, in the 3.1 forms. A `Validatable` hook isn't described.
+- Named structs and enums are inlined, so a reader needs no `$ref` resolution. The one
+  exception is a type whose schema would hold itself: a named, exported, non-generic struct
+  on a cycle is written once under `"$defs"`, and every use of it, `T` included, is
+  `{"$ref": "#/$defs/<Name>"}`. An unexported or generic type on the cycle is inlined
+  inside it.
+- `T` is checked as `Freeze` checks a request type, and a problem is returned as the error,
+  never a panic: `actions: type <pkg.Type>: field "<path>": unknown validate rule "emial"`.
+  Two types in `$defs` with one name are an error too.
+
+**`actions.Validate(v)`** runs the checks a request with the same body gets: the `validate`
+tags at every depth, the enums, and then the `Validatable` hook.
+
+```go
+report := SendReport{Recipients: []string{"not-an-email", "bob@example.com"}, Priority: 3}
+err := actions.Validate(&report)
+
+var apiErr *actions.APIError
+if errors.As(err, &apiErr) { // apiErr.Status is 422, apiErr.Code is "VALIDATION_ERROR"
+	for _, f := range apiErr.Fields {
+		fmt.Println(f.Field + ": " + f.Message)
+	}
+}
+```
+
+```text
+recipients[0]: must be a valid email address
+priority: must be one of: 1, 5, 10
+```
+
+- It returns nil when `v` is valid, and an `*APIError` (`422`, `VALIDATION_ERROR`) whose
+  `Fields` are named as a request's would be.
+- `v` is a struct or a pointer to one; anything else, a nil pointer included, is valid. Pass
+  a pointer when the hook has a pointer receiver.
+- When `v`'s type declares something `Freeze` refuses, it returns that declaration error,
+  which isn't an `*APIError`. Each type is checked once.
 
 </details>
 

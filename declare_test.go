@@ -494,3 +494,89 @@ func TestFreezeRefusesASelfReferencingInlinedType(t *testing.T) {
 		})
 	}
 }
+
+// Fixtures for the example check.
+type (
+	exampleUndecodable struct {
+		Count int `json:"count" example:"abc"`
+	}
+	exampleOverMax struct {
+		Limit int `json:"-" query:"limit" example:"300" validate:"max=200"`
+	}
+	exampleOutsideEnum struct {
+		State EnumState `json:"state" example:"paused"`
+	}
+	exampleView struct {
+		Name string `json:"name" example:"Grace" validate:"max=3"`
+	}
+	exampleLine struct {
+		Qty int `json:"qty" example:"-2" validate:"min=1"`
+	}
+	exampleLines struct {
+		Lines []exampleLine `json:"lines"`
+	}
+	exampleAddress struct {
+		Zip string `json:"zip" validate:"max=5"`
+	}
+	exampleWhole struct {
+		Address exampleAddress `json:"address" example:"{\"zip\":\"123456\"}"`
+	}
+	exampleElements struct {
+		Tags []string `json:"tags" example:"[\"a\",\"bb\"]" validate:"dive,max=1"`
+	}
+	// exampleFitting holds an example its rules accept on every kind of field.
+	exampleFitting struct {
+		Limit   int            `json:"-" query:"limit" example:"25" validate:"min=1,max=200"`
+		States  []EnumState    `json:"-" query:"state" example:"[\"failed\",\"queued\"]"`
+		Name    string         `json:"name" example:"Ada" validate:"required,max=10"`
+		Tags    []string       `json:"tags" example:"[\"a\"]" validate:"max=3,dive,oneof=a b"`
+		At      time.Time      `json:"at" example:"2026-10-13T12:00:00Z"`
+		ID      uuid.UUID      `json:"id" example:"6ba7b810-9dad-11d1-80b4-00c04fd430c8"`
+		Ratio   *float64       `json:"ratio" example:"0.5"`
+		Address exampleAddress `json:"address" example:"{\"zip\":\"12345\"}"`
+	}
+)
+
+func TestFreezeRefusesAnExampleThatFailsItsRules(t *testing.T) {
+	const prefix = `actions: action "x.list": `
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{
+			"an example that does not decode into its type", freezeRefusal[exampleUndecodable, struct{}](t),
+			prefix + `field "count": example does not decode into int`,
+		},
+		{
+			"a parameter's example over its max", freezeRefusal[exampleOverMax, struct{}](t),
+			prefix + `field "limit": example must be at most 200`,
+		},
+		{
+			"an example outside its enum", freezeRefusal[exampleOutsideEnum, struct{}](t),
+			prefix + `field "state": example must be one of: queued, running, failed`,
+		},
+		{
+			"an example on a response type", freezeRefusal[struct{}, exampleView](t),
+			prefix + `field "name": example must be at most 3 characters`,
+		},
+		{
+			"an example on a nested field", freezeRefusal[exampleLines, struct{}](t),
+			prefix + `field "lines[].qty": example must be at least 1`,
+		},
+		{
+			"an example that fails a nested struct's rule", freezeRefusal[exampleWhole, struct{}](t),
+			prefix + `field "address": example zip: must be at most 5 characters`,
+		},
+		{
+			"an example that fails an element rule", freezeRefusal[exampleElements, struct{}](t),
+			prefix + `field "tags": example [1]: must be at most 1 characters`,
+		},
+		{"examples their rules accept", freezeRefusal[exampleFitting, exampleFitting](t), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.got)
+		})
+	}
+}

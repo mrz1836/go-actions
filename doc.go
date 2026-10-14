@@ -6,7 +6,12 @@
 // derived from the same reflected types and the same parsed struct tags, so the
 // published contract cannot drift from runtime behavior. Freeze checks every
 // declaration at startup, including that each action documents the success
-// status its response type produces.
+// status its response type produces, and that each example tag passes its
+// field's own rules.
+//
+// The same schema and rules reach a payload that is not a request: SchemaFor
+// returns a type's self-contained JSON Schema, and Validate runs the checks a
+// request body with that type would get.
 //
 // The core depends only on the standard library, github.com/go-chi/chi/v5,
 // github.com/google/uuid, and gopkg.in/yaml.v3. It carries no domain types:
