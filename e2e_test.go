@@ -410,6 +410,17 @@ type filtered struct {
 	Limits []int    `json:"limits"`
 }
 
+// E2EKind is an enum a list filter takes repeated.
+type E2EKind string
+
+// EnumValues lists the kinds.
+func (E2EKind) EnumValues() []E2EKind { return []E2EKind{"email", "sms"} }
+
+// kindsFilter echoes the kinds a list filter bound.
+type kindsFilter struct {
+	Kinds []E2EKind `json:"kinds" query:"kind"`
+}
+
 // TestE2E_RepeatedQueryParameters proves, on a served registry, that a slice
 // query parameter receives every value of the repeated parameter, that a bad
 // element is a 422 naming it, and that the contract says how to send the list.
@@ -421,6 +432,13 @@ func TestE2E_RepeatedQueryParameters(t *testing.T) {
 		Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
 		Handle: func(_ context.Context, req filterReq) (filtered, error) {
 			return filtered{States: req.States, Limits: req.Limits}, nil
+		},
+	})
+	actions.Register(reg, actions.Action[kindsFilter, kindsFilter]{
+		ID: "test.kinds", Method: http.MethodGet, Path: "/kinds", Summary: "Filter by kind",
+		Statuses: []actions.StatusDoc{{Code: http.StatusOK}},
+		Handle: func(_ context.Context, req kindsFilter) (kindsFilter, error) {
+			return req, nil
 		},
 	})
 	base := actiontest.NewServer(t, reg).URL
@@ -464,6 +482,47 @@ func TestE2E_RepeatedQueryParameters(t *testing.T) {
 		assert.Equal(t, "form", params[0].Style)
 		assert.True(t, params[0].Explode)
 		assert.Equal(t, map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, params[0].Schema)
+	})
+
+	t.Run("enum values in the set reach the handler", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/kinds?kind=email&kind=sms", "")
+		assert.Equal(t, http.StatusOK, status, body)
+		assert.JSONEq(t, `{"kinds":["email","sms"]}`, body)
+	})
+
+	t.Run("an enum value outside the set is a 422 naming the values", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/kinds?kind=email&kind=fax", "")
+		assert.Equal(t, http.StatusUnprocessableEntity, status)
+		var got map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &got))
+		assert.Equal(t, "validation failed: kind[1]: must be one of: email, sms", got["error"])
+		assert.Equal(t, actions.CodeValidation, got["code"])
+	})
+
+	t.Run("the contract references the enum's component", func(t *testing.T) {
+		t.Parallel()
+		status, _, body := doReq(t, http.MethodGet, base+"/openapi.json", "")
+		require.Equal(t, http.StatusOK, status)
+		var doc struct {
+			Paths map[string]map[string]struct {
+				Parameters []struct {
+					Name   string         `json:"name"`
+					Schema map[string]any `json:"schema"`
+				} `json:"parameters"`
+			} `json:"paths"`
+			Components struct {
+				Schemas map[string]any `json:"schemas"`
+			} `json:"components"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(body), &doc))
+		params := doc.Paths["/kinds"]["get"].Parameters
+		require.Len(t, params, 1)
+		assert.Equal(t, "kind", params[0].Name)
+		ref := map[string]any{"$ref": "#/components/schemas/E2EKind"}
+		assert.Equal(t, map[string]any{"type": "array", "items": ref}, params[0].Schema)
+		assert.Equal(t, map[string]any{"type": "string", "enum": []any{"email", "sms"}}, doc.Components.Schemas["E2EKind"])
 	})
 }
 

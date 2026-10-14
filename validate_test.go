@@ -309,10 +309,16 @@ func TestValidateRequest(t *testing.T) {
 	})
 }
 
+// fuzzState is FuzzValidateRequest's enum.
+type fuzzState string
+
+// EnumValues lists the fuzzed enum's values.
+func (fuzzState) EnumValues() []fuzzState { return []fuzzState{"a", "b"} }
+
 // FuzzValidateRequest proves validateRequest never panics across the full rule
-// vocabulary (required/min/max/oneof/uuid/email/e164/rfc3339/date) — on top-level,
-// pointer, and nested (struct, slice, and map) fields — when fed arbitrary
-// values, and that every failure names its field.
+// vocabulary (required/min/max/oneof/uuid/email/e164/rfc3339/date, and dive) and
+// an enum — on top-level, pointer, and nested (struct, slice, and map) fields —
+// when fed arbitrary values, and that every failure names its field.
 func FuzzValidateRequest(f *testing.F) {
 	f.Add("jane@example.com", "+13055551234", "01900000-0000-7000-8000-000000000001", "2026-05-20T00:00:00Z", "2024-02-29", "b", 50, "line", 2, true)
 	f.Add("", "", "", "", "", "", 0, "", 0, false)
@@ -334,6 +340,8 @@ func FuzzValidateRequest(f *testing.F) {
 			Lines []line           `json:"lines" validate:"max=1"`
 			ByKey map[string]*line `json:"by_key"`
 			Ptr   *line            `json:"ptr"`
+			Tags  []string         `json:"tags" validate:"max=3,dive,oneof=a b"`
+			State fuzzState        `json:"state"`
 		}
 		l := line{Name: name}
 		if withPtr {
@@ -346,6 +354,8 @@ func FuzzValidateRequest(f *testing.F) {
 		if withPtr {
 			v.Ptr = &l
 		}
+		v.Tags = []string{kind, name, email, ""}
+		v.State = fuzzState(kind)
 		// contract: must not panic on any input, and every failure is named.
 		if apiErr := validateRequest(&v); apiErr != nil {
 			for _, fe := range apiErr.Fields {
@@ -681,7 +691,7 @@ func TestValidateFormatRulesApplyOnlyToStrings(t *testing.T) {
 		freezeRefusal[id, Empty](t))
 	assert.Equal(t, `actions: action "x.list": field "code": validate rule "email" does not apply to int`,
 		freezeRefusal[code, Empty](t))
-	assert.Equal(t, `actions: action "x.list": field "items": validate rule "e164" does not apply to []string`,
+	assert.Equal(t, `actions: action "x.list": field "items": validate rule "e164" does not apply to []string; check elements after dive`,
 		freezeRefusal[items, Empty](t))
 }
 
@@ -882,7 +892,7 @@ func TestParseRules(t *testing.T) {
 	}{
 		{name: "empty tag", tag: "", typ: strType},
 		{name: "blank segments and spaces", tag: " required ,, max=3 ", typ: strType, kinds: []ruleKind{ruleRequired, ruleMax}},
-		{name: "unknown rule", tag: "dive,required", typ: strType, kinds: []ruleKind{ruleRequired}, err: `unknown validate rule "dive"`},
+		{name: "unknown rule", tag: "dive,required", typ: strType, kinds: []ruleKind{ruleRequired}, err: `dive applies once, to a slice or an array`},
 		{name: "non-numeric bound", tag: "min=abc", typ: intType, err: `validate rule "min" has an invalid argument`},
 		{name: "NaN and Inf bounds", tag: "min=NaN,max=Inf", typ: intType, err: `validate rule "min" has an invalid argument`},
 		{name: "fractional number bound", tag: "min=0.5", typ: intType, kinds: []ruleKind{ruleMin}},
@@ -890,7 +900,7 @@ func TestParseRules(t *testing.T) {
 		{name: "negative length bound", tag: "min=-1", typ: sliceType, err: `validate rule "min" has an invalid argument`},
 		{name: "negative number bound", tag: "min=-1", typ: intType, kinds: []ruleKind{ruleMin}},
 		{name: "bound on a bool", tag: "min=1", typ: reflect.TypeFor[bool](), kinds: nil, err: `validate rule "min" does not apply to bool`},
-		{name: "format on a slice", tag: "uuid,email,e164,rfc3339,date", typ: sliceType, err: `validate rule "uuid" does not apply to []int`},
+		{name: "format on a slice", tag: "uuid,email,e164,rfc3339,date", typ: sliceType, err: `validate rule "uuid" does not apply to []int; check elements after dive`},
 		{name: "formats on a string", tag: "uuid,email,e164,rfc3339,date", typ: strType, kinds: []ruleKind{ruleUUID, ruleEmail, ruleE164, ruleRFC3339, ruleDate}},
 		{name: "date on a string", tag: "date", typ: strType, kinds: []ruleKind{ruleDate}},
 		{name: "date on a string pointer", tag: "date", typ: reflect.TypeFor[*string](), kinds: []ruleKind{ruleDate}},
@@ -903,7 +913,7 @@ func TestParseRules(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rules, err := parseRules(tc.tag, tc.typ)
 			var kinds []ruleKind
-			for _, r := range rules {
+			for _, r := range rules.field {
 				kinds = append(kinds, r.kind)
 			}
 			assert.Equal(t, tc.kinds, kinds)
@@ -918,9 +928,9 @@ func TestParseRules(t *testing.T) {
 	t.Run("bounds render canonically in messages", func(t *testing.T) {
 		rules, err := parseRules("min=1e1,max=2.50", intType)
 		require.NoError(t, err)
-		require.Len(t, rules, 2)
-		assert.Equal(t, "must be at least 10", rules[0].msg)
-		assert.Equal(t, "must be at most 2.5", rules[1].msg)
+		require.Len(t, rules.field, 2)
+		assert.Equal(t, "must be at least 10", rules.field[0].msg)
+		assert.Equal(t, "must be at most 2.5", rules.field[1].msg)
 	})
 }
 

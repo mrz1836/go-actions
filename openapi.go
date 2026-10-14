@@ -141,11 +141,11 @@ func buildParameters(sb *schemaBuilder, reqType reflect.Type) []any {
 		// Freeze has already refused a tag with a rule parseRules refuses.
 		rules, _ := parseRules(p.field.Tag.Get("validate"), p.field.Type)
 		schema := sb.schemaFor(p.field.Type, modeRequest)
-		applyConstraints(schema, rules)
+		applyRuleSet(schema, rules)
 		param := map[string]any{
 			"name":     p.name,
 			"in":       p.in,
-			"required": p.in == "path" || hasRequiredRule(rules),
+			"required": p.in == "path" || hasRequiredRule(rules.field),
 			"schema":   schema,
 		}
 		if isSliceParam(p) {

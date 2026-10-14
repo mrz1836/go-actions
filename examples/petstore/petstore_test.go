@@ -125,3 +125,62 @@ func TestRegistryServesContractEndpoints(t *testing.T) {
 		}
 	}
 }
+
+func TestRegistryListPetsByTag(t *testing.T) {
+	t.Parallel()
+	srv := actiontest.NewServer(t, Registry())
+
+	for _, tc := range []struct {
+		query string
+		names []string
+	}{
+		{"?tag=dog&tag=cat", []string{"Rex", "Mittens"}},
+		{"?tag=dog", []string{"Rex"}},
+		{"?tag=cat&limit=1", []string{"Mittens"}},
+	} {
+		resp := get(t, srv.URL+"/pets"+tc.query)
+		var pets []Pet
+		err := json.NewDecoder(resp.Body).Decode(&pets)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || err != nil {
+			t.Fatalf("GET /pets%s = %d (%v), want 200", tc.query, resp.StatusCode, err)
+		}
+		names := make([]string, len(pets))
+		for i, p := range pets {
+			names[i] = p.Name
+		}
+		if strings.Join(names, ",") != strings.Join(tc.names, ",") {
+			t.Fatalf("GET /pets%s = %v, want %v", tc.query, names, tc.names)
+		}
+	}
+
+	for _, tc := range []struct{ query, message string }{
+		{"?tag=fish", "validation failed: tag[0]: must be one of: dog, cat"},
+		{"?tag=dog&tag=cat&tag=dog", "validation failed: tag: must be at most 2 items"},
+	} {
+		resp := get(t, srv.URL+"/pets"+tc.query)
+		var body struct {
+			Error string `json:"error"`
+		}
+		err := json.NewDecoder(resp.Body).Decode(&body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity || err != nil || body.Error != tc.message {
+			t.Fatalf("GET /pets%s = %d %q (%v), want 422 %q", tc.query, resp.StatusCode, body.Error, err, tc.message)
+		}
+	}
+
+	resp := get(t, srv.URL+"/openapi.json")
+	defer func() { _ = resp.Body.Close() }()
+	var doc struct {
+		Components struct {
+			Schemas map[string]any `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode the contract: %v", err)
+	}
+	got, err := json.Marshal(doc.Components.Schemas["PetTag"])
+	if err != nil || string(got) != `{"enum":["dog","cat"],"type":"string"}` {
+		t.Fatalf("PetTag component = %s (%v)", got, err)
+	}
+}

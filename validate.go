@@ -45,6 +45,9 @@ const (
 	ruleE164
 	ruleRFC3339
 	ruleDate
+	// ruleEnum is an enum type's value check, which every value of the type
+	// carries with or without a validate tag (see enumOf).
+	ruleEnum
 )
 
 // valueShape classifies a field's type (pointers followed) for the rules that
@@ -119,14 +122,25 @@ const (
 	ruleUnknown                 // no rule has that name
 	ruleMisapplied              // the rule does not apply to the field's type
 	ruleBadArgument             // the argument is missing, unexpected, or malformed
+	ruleDiveMisused             // dive a second time, or on a value that is no sequence
+	ruleEnumOneOf               // oneof on an enum type, whose values are already closed
 )
+
+// diveRule is the rule that splits a tag: the rules after it check each
+// element of a slice or array.
+const diveRule = "dive"
 
 // ruleError is a validate rule parseRules refused, worded as Freeze reports it
 // after the field's path.
 type ruleError struct {
 	rule    string // the rule's name, e.g. "min"
 	problem ruleProblem
-	typ     reflect.Type // the field's declared type
+	// typ is the type the rule was read for: the field's declared type, or,
+	// after dive, its element type.
+	typ reflect.Type
+	// collection reports a rule read for the field's own value, so a refusal
+	// on a sequence can point to dive.
+	collection bool
 }
 
 // Error describes the refused rule.
@@ -135,41 +149,125 @@ func (e *ruleError) Error() string {
 	case ruleUnknown:
 		return fmt.Sprintf("unknown validate rule %q", e.rule)
 	case ruleMisapplied:
-		return fmt.Sprintf("validate rule %q does not apply to %s", e.rule, e.typ)
+		msg := fmt.Sprintf("validate rule %q does not apply to %s", e.rule, e.typ)
+		if _, ok := diveElem(e.typ); ok && e.collection {
+			msg += "; check elements after dive"
+		}
+		return msg
+	case ruleDiveMisused:
+		return "dive applies once, to a slice or an array"
+	case ruleEnumOneOf:
+		return fmt.Sprintf("validate rule %q does not apply to the enum type %s", e.rule, qualifiedName(derefType(e.typ)))
 	default:
 		return fmt.Sprintf("validate rule %q has an invalid argument", e.rule)
 	}
 }
 
+// ruleSet is the parsed rules of one validate tag: field checks the field's
+// own value, and elem, the rules after dive, checks each element of its slice
+// or array.
+type ruleSet struct {
+	field []rule
+	elem  []rule
+}
+
 // parseRules parses a validate tag for a field of type t. It returns the rules
 // it accepted and a *ruleError for the first rule it refused: an unknown rule,
-// a rule that does not apply to the field's type, or one whose argument is
-// malformed. A blank segment carries no rule and is skipped. Freeze panics on
-// the refusal, so the validator and the schema generator only ever run on a
-// tag whose every rule was accepted.
-func parseRules(tag string, t reflect.Type) ([]rule, error) {
+// a rule that does not apply to the type it checks, one whose argument is
+// malformed, or a misused dive. The rules before dive check the field's value
+// and those after it each element; a refused dive splits nothing. A blank
+// segment carries no rule and is skipped. Freeze panics on the refusal, so the
+// validator and the schema generator only ever run on a tag whose every rule
+// was accepted.
+func parseRules(tag string, t reflect.Type) (ruleSet, error) {
+	var set ruleSet
 	if tag == "" {
-		return nil, nil
+		return set, nil
 	}
-	shape := shapeOf(t)
-	var rules []rule
-	var refused error
+	var refused *ruleError
+	refuse := func(e *ruleError) {
+		if refused == nil {
+			refused = e
+		}
+	}
+	target, dived := t, false
 	for _, raw := range strings.Split(tag, ",") {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
 		}
 		key, arg, hasArg := strings.Cut(raw, "=")
-		r, problem := parseRule(key, arg, hasArg, shape)
-		if problem != ruleAccepted {
-			if refused == nil {
-				refused = &ruleError{rule: key, problem: problem, typ: t}
+		if key == diveRule {
+			elem, problem := parseDive(t, hasArg, dived)
+			if problem != ruleAccepted {
+				refuse(&ruleError{rule: key, problem: problem})
+				continue
 			}
+			target, dived = elem, true
 			continue
 		}
-		rules = append(rules, r)
+		r, problem := parseRuleFor(key, arg, hasArg, target)
+		switch {
+		case problem != ruleAccepted:
+			refuse(&ruleError{rule: key, problem: problem, typ: target, collection: !dived})
+		case dived:
+			set.elem = append(set.elem, r)
+		default:
+			set.field = append(set.field, r)
+		}
 	}
-	return rules, refused
+	if refused != nil {
+		return set, refused
+	}
+	return set, nil
+}
+
+// parseDive checks a dive rule in a tag for a field of type t, returning the
+// element type the rules after it check. hasArg reports that it was written
+// with "="; dived, that the tag already split.
+func parseDive(t reflect.Type, hasArg, dived bool) (reflect.Type, ruleProblem) {
+	if hasArg {
+		return nil, ruleBadArgument
+	}
+	elem, ok := diveElem(t)
+	if dived || !ok {
+		return nil, ruleDiveMisused
+	}
+	return elem, ruleAccepted
+}
+
+// diveElem returns the element type of t (pointers followed) when dive applies
+// to it: a slice or an array that the schema documents as an array, so not a
+// []byte (a base64 string) or a type that encodes itself.
+func diveElem(t reflect.Type) (reflect.Type, bool) {
+	t = derefType(t)
+	if (t.Kind() != reflect.Slice && t.Kind() != reflect.Array) || isByteSlice(t) || encodesItself(t) {
+		return nil, false
+	}
+	return t.Elem(), true
+}
+
+// derefType returns t with every pointer followed.
+func derefType(t reflect.Type) reflect.Type {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t
+}
+
+// parseRuleFor parses one rule for a value of type t. A value of an enum type
+// takes only required: its values are already closed, and its schema is the
+// enum's own, which no other keyword can join. oneof there gets its own
+// refusal, which names the enum type.
+func parseRuleFor(key, arg string, hasArg bool, t reflect.Type) (rule, ruleProblem) {
+	r, problem := parseRule(key, arg, hasArg, shapeOf(t))
+	if problem == ruleUnknown || key == "required" || !isEnumType(t) {
+		return r, problem
+	}
+	if key == "oneof" {
+		return rule{}, ruleEnumOneOf
+	}
+	return rule{}, ruleMisapplied
 }
 
 // parseRule parses one rule for a field of the given shape, reporting why it
@@ -295,7 +393,7 @@ func (r *rule) fails(v reflect.Value) bool {
 		return measure(v, r.shape) < r.limit
 	case ruleMax:
 		return measure(v, r.shape) > r.limit
-	case ruleOneOf:
+	case ruleOneOf, ruleEnum:
 		return !r.allows(v)
 	case ruleUUID:
 		_, err := uuid.Parse(v.String())
@@ -400,6 +498,9 @@ type vnode struct {
 	// element plan.
 	fields []vfield
 	elem   *vnode
+	// elemRules are the rules a sequence's elements or a map's values carry by
+	// their type: an enum type's value check (see enumRules).
+	elemRules []rule
 	// live reports that some rule is reachable through this node; a node that
 	// is not live is never visited.
 	live bool
@@ -412,6 +513,10 @@ type vfield struct {
 	rules []rule
 	// required reports that rules contains required.
 	required bool
+	// elem are the rules after dive, checked on each element of the field's
+	// slice or array; elemRequired reports that they contain required.
+	elem         []rule
+	elemRequired bool
 	// sub is the plan for the field's value, nil when nothing under it is
 	// checked.
 	sub *vnode
@@ -462,7 +567,7 @@ func validateRequest(v any) *APIError {
 func (val *validator) validate(rv reflect.Value, v any) *APIError {
 	var w walker
 	if val.root.live {
-		val.root.check(&w, rv, noParent)
+		val.root.check(&w, rv, noParent, nil)
 	}
 	fields := w.errs
 	target := v
@@ -504,32 +609,47 @@ func customValidation(v any) []FieldError {
 }
 
 // check validates v (pointers already followed) against the node. parent is
-// the walker segment naming v, or noParent at the request root.
-func (n *vnode) check(w *walker, v reflect.Value, parent int) {
+// the walker segment naming v, or noParent at the request root. dive holds the
+// element rules of the field whose value v is, which a sequence node checks on
+// each element.
+func (n *vnode) check(w *walker, v reflect.Value, parent int, dive *vfield) {
 	switch n.kind {
 	case vnodeStruct:
 		for i := range n.fields {
 			f := &n.fields[i]
 			fv, present := fieldByIndex(v, f.index)
-			f.checkRules(w, fv, present, parent)
+			checkRules(w, fv, present, f.rules, f.required, parent, f.name)
 			if f.sub != nil && present {
 				if ev, ok := deref(fv); ok {
 					at := w.push(pathSeg{parent: parent, label: f.name, kind: segField})
-					f.sub.check(w, ev, at)
+					f.sub.check(w, ev, at, f)
 					w.pop(at)
 				}
 			}
 		}
 	case vnodeSeq:
 		for i := range v.Len() {
-			if ev, ok := deref(v.Index(i)); ok {
-				at := w.push(pathSeg{parent: parent, index: i, kind: segIndex})
-				n.elem.check(w, ev, at)
-				w.pop(at)
+			at := w.push(pathSeg{parent: parent, index: i, kind: segIndex})
+			if dive != nil {
+				checkRules(w, v.Index(i), true, dive.elem, dive.elemRequired, at, "")
 			}
+			n.checkElem(w, v.Index(i), at)
+			w.pop(at)
 		}
 	case vnodeMap:
 		n.checkMap(w, v, parent)
+	}
+}
+
+// checkElem checks one element or map value ev, named by the segment at: the
+// rules its type carries, then the plan for its own value.
+func (n *vnode) checkElem(w *walker, ev reflect.Value, at int) {
+	checkRules(w, ev, true, n.elemRules, false, at, "")
+	if n.elem == nil || !n.elem.live {
+		return
+	}
+	if v, ok := deref(ev); ok {
+		n.elem.check(w, v, at, nil)
 	}
 }
 
@@ -546,20 +666,21 @@ func (n *vnode) checkMap(w *walker, v reflect.Value, parent int) {
 	}
 	slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.key, b.key) })
 	for _, e := range entries {
-		if ev, ok := deref(e.val); ok {
-			at := w.push(pathSeg{parent: parent, label: e.key, kind: segKey})
-			n.elem.check(w, ev, at)
-			w.pop(at)
-		}
+		at := w.push(pathSeg{parent: parent, label: e.key, kind: segKey})
+		n.checkElem(w, e.val, at)
+		w.pop(at)
 	}
 }
 
-// checkRules applies the field's rules to fv. A value that is absent — a nil
-// pointer, or a field behind a nil embedded pointer — fails only required. A
-// non-pointer empty value (see isEmptyValue) likewise skips every other rule.
-// A non-nil pointer is always checked, so an explicit zero is validated.
-func (f *vfield) checkRules(w *walker, fv reflect.Value, present bool, parent int) {
-	if len(f.rules) == 0 {
+// checkRules applies rules to fv, a field's value (named name under the
+// segment parent) or an element's (name "", named by parent alone); required
+// reports that rules contain required. A value that is absent — a nil pointer
+// or interface, or a field behind a nil embedded pointer — fails only
+// required. A non-pointer empty value (see isEmptyValue) likewise skips every
+// other rule. A non-nil pointer is always checked, so an explicit zero is
+// validated.
+func checkRules(w *walker, fv reflect.Value, present bool, rules []rule, required bool, parent int, name string) {
+	if len(rules) == 0 {
 		return
 	}
 	v, ok := fv, present
@@ -573,14 +694,14 @@ func (f *vfield) checkRules(w *walker, fv reflect.Value, present bool, parent in
 		v = v.Elem()
 	}
 	if !ok || (!isPointer && isEmptyValue(v)) {
-		if f.required {
-			w.fail(parent, f.name, "is required")
+		if required {
+			w.fail(parent, name, "is required")
 		}
 		return
 	}
-	for i := range f.rules {
-		if r := &f.rules[i]; r.fails(v) {
-			w.fail(parent, f.name, r.msg)
+	for i := range rules {
+		if r := &rules[i]; r.fails(v) {
+			w.fail(parent, name, r.msg)
 		}
 	}
 }
@@ -672,12 +793,15 @@ func (w *walker) pop(at int) {
 	w.segs = w.segs[:at]
 }
 
-// fail records a failure of the field name under the segment parent.
+// fail records a failure of the field name under the segment parent, or, when
+// name is "", of the element or map value parent names.
 func (w *walker) fail(parent int, name, message string) {
 	var b strings.Builder
 	if parent != noParent {
 		w.writePath(&b, parent)
-		b.WriteByte('.')
+		if name != "" {
+			b.WriteByte('.')
+		}
 	}
 	b.WriteString(name)
 	w.errs = append(w.errs, FieldError{Field: b.String(), Message: message})
@@ -740,7 +864,7 @@ func compileValidator(t reflect.Type) *validator {
 	}
 	for _, p := range params {
 		if _, unbound := paramAt[p.index]; unbound {
-			root.fields = append(root.fields, newVField(p.name, []int{p.index}, p.field.Tag.Get("validate"), p.field.Type))
+			root.fields = append(root.fields, c.field(p.name, []int{p.index}, p.field))
 		}
 	}
 	slices.SortFunc(root.fields, func(a, b vfield) int { return slices.Compare(a.index, b.index) })
@@ -756,17 +880,19 @@ func (c *validatorCompiler) field(name string, index []int, sf reflect.StructFie
 	return f
 }
 
-// newVField builds a field with its parsed rules. A tag with a refused rule
-// never reaches a request, because Freeze panics on it.
+// newVField builds a field with its parsed rules (the element rules after
+// dive included), and with the value check of its type when that is an enum
+// type (see enumRules). A tag with a refused rule never reaches a request,
+// because Freeze panics on it.
 func newVField(name string, index []int, tag string, t reflect.Type) vfield {
-	rules, _ := parseRules(tag, t)
-	f := vfield{name: name, index: index, rules: rules}
-	for _, r := range f.rules {
-		if r.kind == ruleRequired {
-			f.required = true
-		}
+	set, _ := parseRules(tag, t)
+	return vfield{
+		name: name, index: index,
+		rules:        append(set.field, enumRules(t)...),
+		required:     hasRequiredRule(set.field),
+		elem:         set.elem,
+		elemRequired: hasRequiredRule(set.elem),
 	}
-	return f
 }
 
 // nodeFor returns the plan for values of type t (pointers followed), or nil
@@ -799,7 +925,7 @@ func (c *validatorCompiler) nodeFor(t reflect.Type) *vnode {
 		if t.Kind() == reflect.Map {
 			kind = vnodeMap
 		}
-		n = &vnode{kind: kind}
+		n = &vnode{kind: kind, elemRules: enumRules(t.Elem())}
 		c.nodes[t] = n
 		n.elem = c.nodeFor(t.Elem())
 	default:
@@ -825,7 +951,7 @@ func (c *validatorCompiler) resolveLiveness() {
 	for _, n := range c.all {
 		kept := n.fields[:0]
 		for _, f := range n.fields {
-			if f.sub != nil && !f.sub.live {
+			if f.sub != nil && !f.sub.live && len(f.elem) == 0 {
 				f.sub = nil
 			}
 			if len(f.rules) > 0 || f.sub != nil {
@@ -837,13 +963,17 @@ func (c *validatorCompiler) resolveLiveness() {
 }
 
 // reachesRule reports whether the node has a rule of its own or an element or
-// field plan that is live.
+// field plan that is live. A field's element rules count too: they are
+// checked through the field's node.
 func (n *vnode) reachesRule() bool {
+	if len(n.elemRules) > 0 {
+		return true
+	}
 	if n.elem != nil {
 		return n.elem.live
 	}
 	for _, f := range n.fields {
-		if len(f.rules) > 0 || (f.sub != nil && f.sub.live) {
+		if len(f.rules) > 0 || len(f.elem) > 0 || (f.sub != nil && f.sub.live) {
 			return true
 		}
 	}
