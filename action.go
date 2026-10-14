@@ -314,6 +314,10 @@ func structType(t reflect.Type) reflect.Type {
 //   - dive used twice, or on a value that is not a slice or an array (a []byte
 //     and a type that encodes itself included), and any rule but required on
 //     a value of an enum type;
+//   - an example tag, on a parameter or on any field of a request or response
+//     type, whose value does not decode into the field's type or that the
+//     field's checks refuse: its validate rules, the rules after dive, its
+//     enum, and those of the types it holds;
 //   - an EnumValues method that is not func() []T on the value of a string or
 //     integer type T, that returns no values or one value twice, or that sits
 //     on a type that marshals itself;
@@ -341,8 +345,11 @@ func (r *Registry) Freeze() {
 }
 
 // Handler returns the http.Handler mounting every action plus the three
-// self-documentation endpoints (/openapi.json, /openapi.yaml, /_actions). It
-// panics if the registry is not frozen.
+// self-documentation endpoints (/openapi.json, /openapi.yaml, /_actions). A
+// HEAD request gets its status and headers and no body, whatever writes the
+// response: an action, an error, the 404 and 405 handlers, the panic
+// recovery, or the caller's middleware. It panics if the registry is not
+// frozen.
 func (r *Registry) Handler() http.Handler {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -363,11 +370,12 @@ func (r *Registry) Handler() http.Handler {
 
 	// Mux-level middleware wraps every route (actions, self-docs, 404/405):
 	// caller middleware outermost, then request-id propagation, then a panic
-	// backstop, then the router.
+	// backstop, then the router. A HEAD response's body is dropped outside
+	// all of them.
 	muxMW := make([]Middleware, 0, len(r.middleware)+2)
 	muxMW = append(muxMW, r.middleware...)
 	muxMW = append(muxMW, r.requestIDMiddleware, r.recoverMiddleware)
-	return chain(mux, muxMW...)
+	return headBody(chain(mux, muxMW...))
 }
 
 // OpenAPIJSON returns the pre-built OpenAPI document, in the declared dialect
