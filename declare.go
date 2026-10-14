@@ -7,8 +7,8 @@ import (
 
 // declError is one declaration problem, which Freeze panics with.
 type declError struct {
-	subject string // `action "<id>"`
-	detail  string // `field "<path>": …` or `parameter "<name>": …`
+	subject string // `action "<id>"`, or `type <pkg.Type>` for an EnumValues method
+	detail  string // `field "<path>": …`, `parameter "<name>": …`, or `EnumValues …`
 }
 
 // Error renders the problem as Freeze reports it.
@@ -19,8 +19,9 @@ func (e *declError) Error() string { return "actions: " + e.subject + ": " + e.d
 // fields, each depth first in field order. It reads every field the decoder
 // binds, the validator checks, or the schema generator documents, and so
 // refuses a parameter the decoder cannot bind, a validate rule that would
-// otherwise be dropped (see parseRules), and a type that refers to itself but
-// whose schema would be inlined into itself (see structFields).
+// otherwise be dropped (see parseRules), an EnumValues method that breaks the
+// rules (see enumOf), and a type that refers to itself but whose schema would
+// be inlined into itself (see structFields).
 func checkAction(id string, reqType, respType reflect.Type) error {
 	c := &declChecker{
 		subject:  fmt.Sprintf("action %q", id),
@@ -65,7 +66,8 @@ func (c *declChecker) fail(detail string) error {
 }
 
 // params checks the parameter fields of request struct t: that each type can
-// bind from its location, then its validate rules, under the parameter's name.
+// bind from its location, then its validate rules, under the parameter's name,
+// then the EnumValues method of its type and of a slice's element type.
 func (c *declChecker) params(t reflect.Type) error {
 	for _, p := range paramFields(t) {
 		if !bindable(p.field.Type, p.in) {
@@ -73,6 +75,14 @@ func (c *declChecker) params(t reflect.Type) error {
 		}
 		if _, err := parseRules(p.field.Tag.Get("validate"), p.field.Type); err != nil {
 			return c.fail(fmt.Sprintf("field %q: %v", p.name, err))
+		}
+		if _, err := enumOf(p.field.Type); err != nil {
+			return err
+		}
+		if p.field.Type.Kind() == reflect.Slice {
+			if _, err := enumOf(p.field.Type.Elem()); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -98,11 +108,13 @@ func (c *declChecker) fields(t reflect.Type, prefix string) error {
 
 // value descends into a value of type t (pointers followed) at path: a
 // struct's fields, and the elements of a slice or array or the values of a
-// map, named "<path>[]". Like the validator and the schema generator, it never
-// descends into a type that encodes itself.
+// map, named "<path>[]". It checks every type's EnumValues method first, then,
+// like the validator and the schema generator, never descends into a type
+// that encodes itself.
 func (c *declChecker) value(t reflect.Type, path string) error {
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
+	t = derefType(t)
+	if _, err := enumOf(t); err != nil {
+		return err
 	}
 	if encodesItself(t) {
 		return nil

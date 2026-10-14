@@ -311,6 +311,12 @@ func structType(t reflect.Type) reflect.Type {
 //   - a validate rule that is unknown (omitempty included), that does not
 //     apply to its field's type, or whose argument is malformed, on any field
 //     of a request or response type, nested ones included;
+//   - dive used twice, or on a value that is not a slice or an array (a []byte
+//     and a type that encodes itself included), and any rule but required on
+//     a value of an enum type;
+//   - an EnumValues method that is not func() []T on the value of a string or
+//     integer type T, that returns no values or one value twice, or that sits
+//     on a type that marshals itself;
 //   - a parameter whose type cannot bind: a slice in the path or a header; in
 //     the query, a slice of anything but the scalar types, or a []byte; a
 //     pointer to a slice or to another pointer; a map, an array, an

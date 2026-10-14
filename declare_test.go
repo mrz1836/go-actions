@@ -112,8 +112,23 @@ func TestFreezeRefusesARuleThatCannotApply(t *testing.T) {
 		requiredArgument struct {
 			Name string `json:"name" validate:"required=true"`
 		}
-		dive struct {
-			Tags []string `json:"tags" validate:"dive,min=2"`
+		diveTwice struct {
+			Groups [][]string `json:"groups" validate:"dive,dive,min=2"`
+		}
+		diveOnString struct {
+			Name string `json:"name" validate:"dive,min=2"`
+		}
+		elementMisfit struct {
+			Counts []int `json:"counts" validate:"dive,email"`
+		}
+		enumOneOf struct {
+			State EnumState `json:"state" validate:"oneof=queued running"`
+		}
+		enumBound struct {
+			State *EnumState `json:"state" validate:"required,min=1"`
+		}
+		enumElementOneOf struct {
+			States []EnumState `json:"-" query:"state" validate:"dive,oneof=queued"`
 		}
 		paramRule struct {
 			Limit int `json:"-" query:"limit" validate:"min=abc"`
@@ -126,7 +141,7 @@ func TestFreezeRefusesARuleThatCannotApply(t *testing.T) {
 	}{
 		{
 			"oneof on a slice", freezeRefusal[oneofSlice, Empty](t),
-			`actions: action "x.list": field "states": validate rule "oneof" does not apply to []string`,
+			`actions: action "x.list": field "states": validate rule "oneof" does not apply to []string; check elements after dive`,
 		},
 		{
 			"omitempty in a request", freezeRefusal[declOmit, Empty](t),
@@ -165,8 +180,28 @@ func TestFreezeRefusesARuleThatCannotApply(t *testing.T) {
 			`actions: action "x.list": field "name": validate rule "required" has an invalid argument`,
 		},
 		{
-			"dive is not a rule", freezeRefusal[dive, Empty](t),
-			`actions: action "x.list": field "tags": unknown validate rule "dive"`,
+			"dive twice", freezeRefusal[diveTwice, Empty](t),
+			`actions: action "x.list": field "groups": dive applies once, to a slice or an array`,
+		},
+		{
+			"dive on a string", freezeRefusal[diveOnString, Empty](t),
+			`actions: action "x.list": field "name": dive applies once, to a slice or an array`,
+		},
+		{
+			"a rule after dive that doesn't fit the element", freezeRefusal[elementMisfit, Empty](t),
+			`actions: action "x.list": field "counts": validate rule "email" does not apply to int`,
+		},
+		{
+			"oneof on an enum type", freezeRefusal[enumOneOf, Empty](t),
+			`actions: action "x.list": field "state": validate rule "oneof" does not apply to the enum type github.com/mrz1836/go-actions.EnumState`,
+		},
+		{
+			"a bound on an enum type", freezeRefusal[enumBound, Empty](t),
+			`actions: action "x.list": field "state": validate rule "min" does not apply to *actions.EnumState`,
+		},
+		{
+			"oneof on an enum parameter's elements", freezeRefusal[enumElementOneOf, Empty](t),
+			`actions: action "x.list": field "state": validate rule "oneof" does not apply to the enum type github.com/mrz1836/go-actions.EnumState`,
 		},
 		{
 			"a parameter's rule", freezeRefusal[paramRule, Empty](t),
@@ -327,6 +362,9 @@ type fitParams struct {
 	Floats   []float32     `json:"-" query:"floats"`
 	Flags    []bool        `json:"-" query:"flags"`
 	Uints    []uint64      `json:"-" query:"uints"`
+	Kind     EnumState     `json:"-" query:"kind" validate:"required"`
+	Kinds    []EnumState   `json:"-" query:"kinds" validate:"max=2,dive,required"`
+	Words    []string      `json:"-" query:"words" validate:"dive,min=2"`
 	Body     fitBodyFields `json:"body"`
 }
 
@@ -352,6 +390,10 @@ type fitBodyFields struct {
 	Ref     uuid.UUID         `json:"ref" validate:"required"`
 	Payload json.RawMessage   `json:"payload" openapi:"type=object" validate:"required"`
 	Blank   string            `json:"blank" validate:" required ,, max=3 "`
+	Labels  []string          `json:"labels" validate:"max=5,dive,min=1,max=20"`
+	Grid    [][]int           `json:"grid" validate:"dive,min=1"`
+	State   *EnumState        `json:"state" validate:"required"`
+	Prios   []EnumPriority    `json:"prios"`
 }
 
 func TestFreezeAcceptsEveryFittingRule(t *testing.T) {
