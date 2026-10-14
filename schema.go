@@ -106,7 +106,8 @@ func newSchemaBuilder() *schemaBuilder {
 // encoding/json's precedence: a time.Time is a date-time string; a type with its
 // own MarshalJSON (json.RawMessage included) is the empty schema, since its
 // encoding is unknown; a type with its own MarshalText is a string (uuid.UUID a
-// uuid string); a []byte is a base64 string; everything else maps by kind.
+// uuid string); a []byte is a base64 string; an enum type is its values (see
+// enumSchema); everything else maps by kind.
 //
 //nolint:gocyclo // one switch over the Go kind taxonomy
 func (b *schemaBuilder) schemaFor(t reflect.Type, mode schemaMode) map[string]any {
@@ -128,6 +129,9 @@ func (b *schemaBuilder) schemaFor(t reflect.Type, mode schemaMode) map[string]an
 			return map[string]any{schemaTypeKey: typeString, "format": "byte"}
 		}
 		return map[string]any{schemaTypeKey: typeString, "contentEncoding": "base64"}
+	}
+	if spec, _ := enumOf(t); spec != nil {
+		return b.enumSchema(t, spec, mode)
 	}
 	switch t.Kind() { //nolint:exhaustive // unsupported kinds fall through to the default
 	case reflect.String:
@@ -193,6 +197,28 @@ func (b *schemaBuilder) structOrRef(t reflect.Type, mode schemaMode) map[string]
 	return ref
 }
 
+// enumSchema returns enum type t's schema, {"type": "string" | "integer",
+// "enum": [...]} with the values in EnumValues' order. Like a struct, a named,
+// exported, non-generic enum type is interned into the mode's components and
+// referenced by $ref, and any other is inlined (see inlinesStruct). Its schema
+// is the same in both modes, so a request and a response share one component.
+func (b *schemaBuilder) enumSchema(t reflect.Type, spec *enumSpec, mode schemaMode) map[string]any {
+	schema := map[string]any{schemaTypeKey: shapeType(shapeOf(t)), "enum": slices.Clone(spec.values)}
+	if inlinesStruct(t) {
+		return schema
+	}
+	name := t.Name()
+	b.claimName(name, t)
+	interned := b.response
+	if mode == modeRequest {
+		interned = b.request
+	}
+	if _, seen := interned[name]; !seen {
+		interned[name] = schema
+	}
+	return map[string]any{"$ref": componentRefPrefix + name}
+}
+
 // inlinesStruct reports whether the schema generator writes struct type t's
 // schema inline instead of as a component: t is unnamed, unexported, or
 // generic. Only a component can be referred back to, by $ref.
@@ -234,7 +260,7 @@ func (b *schemaBuilder) structSchema(t reflect.Type, mode schemaMode) map[string
 		// while nil.
 		written := mode == modeResponse && !omitsEmpty(f)
 		properties[jf.name] = b.fieldSchema(f, rules, written, mode)
-		if (written && !jf.viaPointer) || hasRequiredRule(rules) {
+		if (written && !jf.viaPointer) || hasRequiredRule(rules.field) {
 			required = append(required, jf.name)
 		}
 	}
@@ -249,11 +275,11 @@ func (b *schemaBuilder) structSchema(t reflect.Type, mode schemaMode) map[string
 // the field type's schema with its validate constraints applied. A pointer the
 // encoder writes whenever the field is present (written) is made nullable,
 // since nil encodes as null.
-func (b *schemaBuilder) fieldSchema(f reflect.StructField, rules []rule, written bool, mode schemaMode) map[string]any {
+func (b *schemaBuilder) fieldSchema(f reflect.StructField, rules ruleSet, written bool, mode schemaMode) map[string]any {
 	schema, overridden := openapiOverride(f.Tag.Get("openapi"))
 	if !overridden {
 		schema = b.schemaFor(f.Type, mode)
-		applyConstraints(schema, rules)
+		applyRuleSet(schema, rules)
 	}
 	if written && f.Type.Kind() == reflect.Pointer {
 		schema = b.nullable(schema)
@@ -412,6 +438,16 @@ func openapiOverride(tag string) (map[string]any, bool) {
 	return nil, false
 }
 
+// applyRuleSet folds a field's parsed validate rules into its schema: the
+// field's own rules into the schema itself, and the element rules after dive
+// into its items. required after dive has no keyword: it is only enforced.
+func applyRuleSet(schema map[string]any, rules ruleSet) {
+	applyConstraints(schema, rules.field)
+	if items, ok := schema["items"].(map[string]any); ok {
+		applyConstraints(items, rules.elem)
+	}
+}
+
 // applyConstraints folds a field's parsed validate rules into its schema. A
 // rule becomes a keyword only when the schema's type matches the Go shape the
 // rule was parsed for — e.g. min on a []byte (a base64 string in the schema)
@@ -434,6 +470,8 @@ func applyConstraints(schema map[string]any, rules []rule) {
 			}
 		case ruleRequired:
 			// Documented through the object's required list.
+		case ruleEnum:
+			// Documented by the enum type's own schema.
 		}
 	}
 }
