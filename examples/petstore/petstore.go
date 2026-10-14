@@ -1,7 +1,8 @@
 // Package petstore builds the example action registry shared by the runnable
 // server example and the OpenAPI snapshot tool. It declares a tiny pet-store API
 // in one place so both examples exercise the same contract, demonstrating
-// path/query/body binding, validation tags, and the response envelopes.
+// path/query/body binding, a repeated query filter typed by an enum,
+// validation tags, and the response envelopes.
 package petstore
 
 import (
@@ -22,9 +23,19 @@ type Pet struct {
 	Tag  string `json:"tag,omitempty"`
 }
 
-// listReq carries the optional paging bound for the list action.
+// PetTag is the kind of pet the list action filters by. Its EnumValues makes
+// it an enum: the contract lists the tags once, as the PetTag component, and a
+// request naming any other tag is refused.
+type PetTag string
+
+// EnumValues lists the tags a pet may carry.
+func (PetTag) EnumValues() []PetTag { return []PetTag{"dog", "cat"} }
+
+// listReq carries the optional paging bound and tag filter for the list action.
+// The filter is repeated, one value each: GET /pets?tag=dog&tag=cat.
 type listReq struct {
-	Limit int `json:"-" query:"limit" validate:"min=0,max=100"`
+	Limit int      `json:"-" query:"limit" validate:"min=0,max=100"`
+	Tags  []PetTag `json:"-" query:"tag" validate:"max=2"`
 }
 
 // getReq carries the path id for the fetch action.
@@ -71,7 +82,8 @@ func Registry() *actions.Registry {
 	return reg
 }
 
-// listAction declares GET /pets, returning every pet up to the optional limit.
+// listAction declares GET /pets, returning every pet with one of the given
+// tags (every pet when none is given), up to the optional limit.
 func (s *store) listAction() actions.Action[listReq, []Pet] {
 	return actions.Action[listReq, []Pet]{
 		ID:       "pets.list",
@@ -81,7 +93,7 @@ func (s *store) listAction() actions.Action[listReq, []Pet] {
 		Tags:     []string{"pets"},
 		Statuses: []actions.StatusDoc{{Code: http.StatusOK, Description: "the pets"}},
 		Handle: func(_ context.Context, req listReq) ([]Pet, error) {
-			return s.list(req.Limit), nil
+			return s.list(req.Limit, req.Tags), nil
 		},
 	}
 }
@@ -130,13 +142,16 @@ func (s *store) createAction() actions.Action[createReq, actions.Created[Pet]] {
 	}
 }
 
-// list returns the stored pets ordered by id, capped at limit (0 = no cap).
-func (s *store) list(limit int) []Pet {
+// list returns the stored pets ordered by id, keeping those whose tag is one
+// of tags (all of them when tags is empty), capped at limit (0 = no cap).
+func (s *store) list(limit int, tags []PetTag) []Pet {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Pet, 0, len(s.pets))
 	for _, p := range s.pets {
-		out = append(out, p)
+		if len(tags) == 0 || slices.Contains(tags, PetTag(p.Tag)) {
+			out = append(out, p)
+		}
 	}
 	slices.SortFunc(out, func(a, b Pet) int { return cmp.Compare(a.ID, b.ID) })
 	if limit > 0 && limit < len(out) {
