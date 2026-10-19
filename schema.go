@@ -407,7 +407,8 @@ func (b *schemaBuilder) nullable(schema map[string]any) map[string]any {
 }
 
 // responseSchema returns the JSON Schema of an action's response body. An Empty
-// response has no body; a Created/Accepted wrapper unwraps to its Body type.
+// response has no body, and a Raw one no JSON body (its media type documents
+// it); a Created/Accepted wrapper unwraps to its Body type.
 func (b *schemaBuilder) responseSchema(respType reflect.Type) (map[string]any, bool) {
 	body, ok := responseBodyType(respType)
 	if !ok {
@@ -417,8 +418,12 @@ func (b *schemaBuilder) responseSchema(respType reflect.Type) (map[string]any, b
 }
 
 // responseBodyType returns the type of an action's response body: Created,
-// Accepted, and Response unwrap to their Body type, and Empty has no body.
+// Accepted, and Response unwrap to their Body type, Empty has no body, and Raw
+// has no JSON body, so neither is checked or schemaed as one.
 func responseBodyType(respType reflect.Type) (reflect.Type, bool) {
+	if isRawType(respType) {
+		return nil, false
+	}
 	for respType.Kind() == reflect.Pointer {
 		respType = respType.Elem()
 	}

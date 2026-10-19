@@ -45,9 +45,17 @@ type Action[Req, Resp any] struct {
 	Timeout time.Duration
 	// Middleware wraps only this action's handler; the first entry is the
 	// outermost. It runs inside the framework's per-action layers (observer,
-	// panic recovery, timeout, body cap) and before the request is decoded. Use
-	// it for per-route concerns such as authentication on a single endpoint.
+	// panic recovery, timeout, body cap), and before the Idempotency-Key step
+	// and the request's decoding. Use it for per-route concerns such as
+	// authentication on a single endpoint.
 	Middleware []Middleware
+	// Annotations are hints for tool hosts (see Annotations), written on the
+	// operation as x-mcp-annotations. Nil writes nothing.
+	Annotations *Annotations
+	// IdempotencyKey makes a POST or PATCH action take an Idempotency-Key
+	// header, optional or required, on a registry built WithIdempotency. The
+	// zero value, IdempotencyKeyOff, takes none.
+	IdempotencyKey IdempotencyKeyUse
 
 	// Handle serves the decoded, validated request. It must not be nil.
 	Handle func(ctx context.Context, req Req) (Resp, error)
@@ -62,6 +70,10 @@ type StatusDoc struct {
 	// Retry-After on a 429. Each becomes an entry in the response's OpenAPI
 	// headers object. Optional.
 	Headers []HeaderDoc
+	// MediaType is the Content-Type of a Raw response's body, such as
+	// "text/csv; charset=utf-8". It is required on the 200 StatusDoc of an
+	// action whose Resp is Raw, and allowed on no other StatusDoc.
+	MediaType string
 }
 
 // HeaderDoc documents one response header of an action outcome.
@@ -154,6 +166,9 @@ type anyAction struct {
 	respType    reflect.Type
 	hasHandle   bool
 	handler     http.HandlerFunc
+
+	annotations    *Annotations
+	idempotencyKey IdempotencyKeyUse
 }
 
 // defaultMaxBodyBytes is the request-body cap applied unless WithMaxBodyBytes
@@ -185,6 +200,9 @@ type Registry struct {
 	requestIDGen     func() string
 	notFound         http.Handler
 	methodNotAllowed http.Handler
+	// idempotency is the Idempotency-Key configuration from WithIdempotency;
+	// nil when it was not used.
+	idempotency *idempotencyConfig
 
 	// OpenAPI contract configuration
 	openapiVersion  string
@@ -237,6 +255,9 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 	withBody := methodHasBody(method)
 	handle := a.Handle
 	strict := reg.strictDecoding
+	// A Raw response is written under its 200 StatusDoc's media type, which
+	// Freeze requires; the other responses are encoded as JSON.
+	mediaType, raw := rawMediaType(reflect.TypeFor[Resp](), a.Statuses)
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		var req Req
 		rv := reflect.ValueOf(&req).Elem()
@@ -264,6 +285,11 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 			reg.writeError(w, r, herr)
 			return
 		}
+		if raw {
+			rawResp, _ := any(resp).(Raw)
+			writeRaw(w, rawResp, mediaType)
+			return
+		}
 		encodeResponse(w, resp)
 	}
 
@@ -283,6 +309,9 @@ func Register[Req, Resp any](reg *Registry, a Action[Req, Resp]) {
 		respType:    reflect.TypeFor[Resp](),
 		hasHandle:   handle != nil,
 		handler:     handler,
+
+		annotations:    a.Annotations.clone(),
+		idempotencyKey: a.IdempotencyKey,
 	})
 }
 
@@ -330,7 +359,12 @@ func structType(t reflect.Type) reflect.Type {
 //     (an unexported, generic, or unnamed type), since that schema would
 //     never end;
 //   - two distinct types sharing a component schema name, a type named Error,
-//     or a <Name>Input name already taken (see the schema generator).
+//     or a <Name>Input name already taken (see the schema generator);
+//   - Annotations that are both ReadOnly and Destructive;
+//   - an IdempotencyKey on a method other than POST or PATCH, or on a
+//     registry without a store (see WithIdempotency);
+//   - an action that returns Raw whose 200 StatusDoc declares no MediaType,
+//     or a MediaType on any other StatusDoc of any action.
 func (r *Registry) Freeze() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -388,9 +422,10 @@ func (r *Registry) OpenAPIYAML() []byte { return r.openapiYAML }
 
 // wrapAction composes one action's handler with its framework and per-action
 // middleware, outermost-first: observe (if configured) → recover → timeout (if
-// set) → body cap (if set) → the action's own Middleware → the typed handler.
+// set) → body cap (if set) → the action's own Middleware → the Idempotency-Key
+// step (if the action takes keys) → the typed handler.
 func (r *Registry) wrapAction(a anyAction) http.Handler {
-	mw := make([]Middleware, 0, 4+len(a.middleware))
+	mw := make([]Middleware, 0, 5+len(a.middleware))
 	if r.observer != nil {
 		mw = append(mw, r.observeMiddleware(a.id, a.method, a.path))
 	}
@@ -402,6 +437,9 @@ func (r *Registry) wrapAction(a anyAction) http.Handler {
 		mw = append(mw, r.maxBytesMiddleware)
 	}
 	mw = append(mw, a.middleware...)
+	if a.idempotencyKey != IdempotencyKeyOff {
+		mw = append(mw, r.idempotencyStep(a))
+	}
 	return chain(a.handler, mw...)
 }
 
@@ -452,6 +490,7 @@ func (r *Registry) validateActions() {
 		}
 		validateHeaderDocs(a)
 		validateSuccessStatus(a)
+		r.validateActionOptions(a)
 		if seenID[a.id] {
 			panic(fmt.Sprintf("actions: duplicate action ID %q", a.id))
 		}
@@ -510,6 +549,37 @@ func validateSuccessStatus(a anyAction) {
 	}
 	panic(fmt.Sprintf("actions: action %q responds %d on success (Resp %s) but documents no non-error %d StatusDoc",
 		a.id, status, a.respType, status))
+}
+
+// validateActionOptions panics on an action option that cannot work: tool
+// annotations that contradict each other, an idempotency key on a method a
+// client doesn't retry with one or on a registry with no store, and a media
+// type the encoder would never write.
+func (r *Registry) validateActionOptions(a anyAction) {
+	if a.annotations != nil && a.annotations.ReadOnly && a.annotations.Destructive {
+		panic(fmt.Sprintf("actions: action %q: annotations cannot be both read-only and destructive", a.id))
+	}
+	if a.idempotencyKey != IdempotencyKeyOff {
+		if a.method != http.MethodPost && a.method != http.MethodPatch {
+			panic(fmt.Sprintf("actions: action %q: idempotency keys apply to POST and PATCH", a.id))
+		}
+		if r.idempotency == nil {
+			panic(fmt.Sprintf("actions: action %q uses idempotency keys but the registry has no store", a.id))
+		}
+	}
+	rawDoc := -1
+	if isRawType(a.respType) {
+		// validateSuccessStatus has made sure a non-error 200 is documented.
+		rawDoc = rawStatusIndex(a.statuses)
+		if a.statuses[rawDoc].MediaType == "" {
+			panic(fmt.Sprintf("actions: action %q returns Raw but its 200 StatusDoc declares no MediaType", a.id))
+		}
+	}
+	for i, sd := range a.statuses {
+		if sd.MediaType != "" && i != rawDoc {
+			panic(fmt.Sprintf("actions: action %q: MediaType applies only to the 200 StatusDoc of an action that returns Raw", a.id))
+		}
+	}
 }
 
 // validateHeaderDocs panics on a documented response header without a name.

@@ -115,7 +115,14 @@ func buildOperation(sb *schemaBuilder, a anyAction) map[string]any {
 	if a.security != nil {
 		op["security"] = securityToList(a.security)
 	}
-	if params := buildParameters(sb, a.reqType); len(params) > 0 {
+	if a.annotations != nil {
+		op["x-mcp-annotations"] = a.annotations.extension()
+	}
+	params := buildParameters(sb, a.reqType)
+	if a.idempotencyKey != IdempotencyKeyOff {
+		params = append(params, idempotencyKeyParameter(a.idempotencyKey == IdempotencyKeyRequired))
+	}
+	if len(params) > 0 {
 		op["parameters"] = params
 	}
 	if body := buildRequestBody(sb, a.method, a.reqType); body != nil {
@@ -205,6 +212,10 @@ func buildResponses(sb *schemaBuilder, a anyAction) map[string]any {
 		switch {
 		case sd.Error:
 			resp["content"] = jsonContent(map[string]any{"$ref": "#/components/schemas/Error"})
+		case sd.MediaType != "":
+			// Freeze allows a MediaType only on a Raw action's 200: its body is
+			// the bytes the action returns.
+			resp["content"] = map[string]any{sd.MediaType: map[string]any{"schema": map[string]any{schemaTypeKey: typeString}}}
 		case hasBody && bodySchema != nil:
 			resp["content"] = jsonContent(bodySchema)
 		}
@@ -213,7 +224,47 @@ func buildResponses(sb *schemaBuilder, a anyAction) map[string]any {
 		}
 		responses[strconv.Itoa(sd.Code)] = resp
 	}
+	if a.idempotencyKey != IdempotencyKeyOff {
+		addIdempotencyResponses(responses)
+	}
 	return responses
+}
+
+// idempotencyKeyParameter is the Idempotency-Key header parameter of an action
+// that takes keys.
+func idempotencyKeyParameter(required bool) map[string]any {
+	return map[string]any{
+		"name":     idempotencyKeyHeader,
+		"in":       "header",
+		"required": required,
+		"description": "A key unique to this request, so a retry runs it at most once: " +
+			"a quoted string or the same characters bare, up to 255 characters.",
+		"schema": map[string]any{schemaTypeKey: typeString},
+	}
+}
+
+// addIdempotencyResponses documents the key step's 409 (with its Retry-After
+// header) and 422 Error responses, each unless the action documents that
+// status itself.
+func addIdempotencyResponses(responses map[string]any) {
+	errorContent := func() map[string]any {
+		return jsonContent(map[string]any{"$ref": "#/components/schemas/Error"})
+	}
+	if _, documented := responses[strconv.Itoa(http.StatusConflict)]; !documented {
+		responses[strconv.Itoa(http.StatusConflict)] = map[string]any{
+			"description": msgIdempotencyKeyInUse,
+			"content":     errorContent(),
+			"headers": responseHeaders([]HeaderDoc{{
+				Name: "Retry-After", Description: "Seconds to wait before retrying.", Type: "integer", Required: true,
+			}}),
+		}
+	}
+	if _, documented := responses[strconv.Itoa(http.StatusUnprocessableEntity)]; !documented {
+		responses[strconv.Itoa(http.StatusUnprocessableEntity)] = map[string]any{
+			"description": msgIdempotencyKeyReused,
+			"content":     errorContent(),
+		}
+	}
 }
 
 // responseHeaders builds a response's OpenAPI headers object from its
@@ -244,13 +295,17 @@ func jsonContent(schema map[string]any) map[string]any {
 	}
 }
 
-// errorCodeEnum returns the sorted, de-duplicated union of the built-in codes
-// and those passed to WithErrorCodes, or nil when WithErrorCodes was not used.
+// errorCodeEnum returns the sorted, de-duplicated union of the built-in codes,
+// those passed to WithErrorCodes, and, on a registry built WithIdempotency, the
+// two Idempotency-Key codes; or nil when WithErrorCodes was not used.
 func (r *Registry) errorCodeEnum() []string {
 	if r.errorCodes == nil {
 		return nil
 	}
 	codes := append(builtinErrorCodes(), r.errorCodes...)
+	if r.idempotency != nil {
+		codes = append(codes, CodeIdempotencyKeyInUse, CodeIdempotencyKeyReused)
+	}
 	slices.Sort(codes)
 	return slices.Compact(codes)
 }

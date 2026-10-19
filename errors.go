@@ -13,9 +13,11 @@ import (
 // Stable, transport-level error codes. These are generic HTTP error codes with
 // no domain coupling; a custom ErrorMapper may emit any code it likes. The
 // framework itself emits only CodeValidation, CodeBadRequest, CodeNotFound,
-// CodeInternal, CodeMethodNotAllowed, CodePayloadTooLarge, and CodeTimeout; the
-// remaining codes are provided as a stable vocabulary for ErrorMappers and
-// handlers so services across the ecosystem agree on the wire spelling.
+// CodeInternal, CodeMethodNotAllowed, CodePayloadTooLarge, and CodeTimeout,
+// and, on a registry built WithIdempotency, CodeServiceUnavailable,
+// CodeIdempotencyKeyInUse, and CodeIdempotencyKeyReused; the remaining codes
+// are provided as a stable vocabulary for ErrorMappers and handlers so services
+// across the ecosystem agree on the wire spelling.
 const (
 	CodeValidation         = "VALIDATION_ERROR"
 	CodeBadRequest         = "BAD_REQUEST"
@@ -29,6 +31,15 @@ const (
 	CodeMethodNotAllowed   = "METHOD_NOT_ALLOWED"
 	CodeTimeout            = "TIMEOUT"
 	CodeServiceUnavailable = "SERVICE_UNAVAILABLE"
+)
+
+// The Idempotency-Key codes, emitted only by a registry built WithIdempotency:
+// a 409 for a key whose first request still runs, and a 422 for a key used for
+// another request. They are not built-ins: they join the Error schema's code
+// enum (with WithErrorCodes) only on such a registry.
+const (
+	CodeIdempotencyKeyInUse  = "IDEMPOTENCY_KEY_IN_USE"
+	CodeIdempotencyKeyReused = "IDEMPOTENCY_KEY_REUSED"
 )
 
 // builtinErrorCodes returns the framework's Code* vocabulary.
