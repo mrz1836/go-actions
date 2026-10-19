@@ -3,9 +3,9 @@ module github.com/mrz1836/go-actions
 go 1.26.0
 
 require (
-	github.com/go-chi/chi/v5 v5.4.0
+	github.com/go-chi/chi/v5 v5.5.0
 	github.com/google/uuid v1.6.0
-	github.com/mrz1836/go-foundation v0.13.0
+	github.com/mrz1836/go-foundation v0.13.1
 	github.com/stretchr/testify v1.12.1
 	gopkg.in/yaml.v3 v3.0.1
 )
