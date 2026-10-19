@@ -2,7 +2,8 @@
 // server example and the OpenAPI snapshot tool. It declares a tiny pet-store API
 // in one place so both examples exercise the same contract, demonstrating
 // path/query/body binding, a repeated query filter typed by an enum,
-// validation tags, and the response envelopes.
+// validation tags, and the response envelopes, as well as a create that takes
+// an optional Idempotency-Key and a read that carries tool annotations.
 package petstore
 
 import (
@@ -75,7 +76,13 @@ func Registry() *actions.Registry {
 		"Pet Store",
 		"A tiny example API built with go-actions.",
 		"1.0.0",
-	))
+	),
+		// The example has no callers to tell apart, so every key shares one
+		// scope; a real service returns the caller's identity here.
+		actions.WithIdempotency(actions.NewMemoryIdempotencyStore(), actions.IdempotencyOptions{
+			Scope: func(*http.Request) string { return "example" },
+		}),
+	)
 	actions.Register(reg, s.listAction())
 	actions.Register(reg, s.getAction())
 	actions.Register(reg, s.createAction())
@@ -110,6 +117,7 @@ func (s *store) getAction() actions.Action[getReq, Pet] {
 			{Code: http.StatusOK, Description: "the pet"},
 			{Code: http.StatusNotFound, Description: "no such pet", Error: true},
 		},
+		Annotations: &actions.Annotations{ReadOnly: true, Idempotent: true},
 		Handle: func(_ context.Context, req getReq) (Pet, error) {
 			pet, ok := s.get(req.ID)
 			if !ok {
@@ -136,6 +144,7 @@ func (s *store) createAction() actions.Action[createReq, actions.Created[Pet]] {
 			{Code: http.StatusCreated, Description: "the created pet"},
 			{Code: http.StatusUnprocessableEntity, Description: "invalid body", Error: true},
 		},
+		IdempotencyKey: actions.IdempotencyKeyOptional,
 		Handle: func(_ context.Context, req createReq) (actions.Created[Pet], error) {
 			return actions.Created[Pet]{Body: s.create(req)}, nil
 		},

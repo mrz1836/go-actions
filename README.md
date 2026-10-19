@@ -130,7 +130,12 @@ misdeclared route fails on boot, not in production. It rejects:
 - an `EnumValues` method that breaks an enum's rules (**Validation tags** below);
 - a parameter field whose type can't bind (**Request binding** below);
 - a type that refers to itself but would be inlined, because it is unexported or generic
-  (**Schema generation** below); and
+  (**Schema generation** below);
+- `Annotations` that are both `ReadOnly` and `Destructive` (**Tool annotations** below);
+- an `IdempotencyKey` on a method other than `POST` or `PATCH`, or on a registry without
+  a store (**Idempotency keys** below);
+- a `Raw` action whose `200` `StatusDoc` declares no `MediaType`, or a `MediaType` on any
+  other `StatusDoc` (**Raw responses** below); and
 - two different types that would share a component schema name, a type named `Error`,
   or a `<Name>Input` name that is already taken.
 
@@ -147,6 +152,7 @@ The highlights:
 - **Enums on named types**: give a string or integer type an `EnumValues()` method, and its values become one named component in the contract and are checked wherever the type is used, with no tag.
 - **Described fields**: a `doc` tag becomes a field's or a parameter's description, and an `example` tag its example, which `Freeze` checks against the field's own rules.
 - **Schemas and validation outside HTTP**: `SchemaFor[T]()` returns a self-contained JSON Schema for a payload type, and `Validate(v)` runs the checks a request would, so a queued job's arguments or a stored setting share the contract's rules.
+- **Ready for tools and retries**: `Annotations` put each action's hints for tool hosts (`x-mcp-annotations`) in the contract; `WithIdempotency` makes a retried `POST` or `PATCH` with the same `Idempotency-Key` get the first response instead of running twice; and `Raw` sends a body that isn't JSON, such as a CSV, under the media type the contract declares.
 - **No domain coupling**: the core imports only the standard library, `go-chi/chi/v5`, `google/uuid`, and `gopkg.in/yaml.v3`.
 
 > Why it matters: in 2026, your API contract is consumed by SDK generators, API
@@ -403,10 +409,11 @@ a slice type with one (`net.IP`): it takes one value, like any scalar.
 | `actions.Created[T]` | `201` | `T` | `201` |
 | `actions.Accepted[T]` | `202` | `T` | `202` |
 | `actions.Response[T]` | its `Status` (`200` when zero) | `T` (none when `Status` is `204` or `304`), plus its `Header` | every status the handler can pick; `Freeze` cannot check these |
+| `actions.Raw` | `200` | its `Body` as given, under the `200` `StatusDoc`'s `MediaType`, plus its `Header` | `200`, with a `MediaType` (see raw responses) |
 | anything else (a struct, a slice, `Page[T]`, `List[T]`, …) | `200` | the value | `200` |
 
-Bodies are encoded with `encoding/json` as `application/json`. If encoding fails, the
-response is a `500` with the fixed body
+Bodies other than a `Raw` one are encoded with `encoding/json` as `application/json`. If
+encoding fails, the response is a `500` with the fixed body
 `{"error":"failed to encode response","code":"INTERNAL_ERROR"}`. A `204` or `304` has no
 content, so it is written with its status and headers only: no body, and no
 `Content-Type`, `Content-Length`, or `Transfer-Encoding`, even when a handler or a
@@ -492,7 +499,8 @@ type ErrorMapper func(error) APIError
 ```
 
 **Every error goes through the mapper**, including the `*APIError`s the framework creates
-for bad requests (`400`, `413`, `422`) and timeouts (`504`). The default mapper passes any
+for bad requests (`400`, `413`, `422`), timeouts (`504`), and idempotency keys (`400`,
+`409`, `422`, `503`). The default mapper passes any
 `*APIError` through unchanged. It matches with `errors.As`, so a wrapped one counts too.
 It maps every other error to a redacted `500`, so internal detail never reaches the wire.
 A custom mapper must keep that passthrough:
@@ -513,8 +521,8 @@ reg := actions.NewRegistry(actions.WithErrorMapper(func(err error) actions.APIEr
 ```
 
 > [!WARNING]
-> Without the `errors.As(err, &apiErr)` passthrough, every built-in `400`, `413`, `422`,
-> and `504` becomes whatever your fallback returns, usually a `500`.
+> Without the `errors.As(err, &apiErr)` passthrough, every built-in `400`, `409`, `413`,
+> `422`, `503`, and `504` becomes whatever your fallback returns, usually a `500`.
 
 Panics, the default 404/405 responses, and response-encoding failures are written
 directly, without the mapper. A mapped `Status` of `0` becomes `500`.
@@ -543,10 +551,18 @@ directly, without the mapper. A mapped `Status` of `0` becomes `500`.
 | `500` | `INTERNAL_ERROR` | `failed to encode response` | the response body failed to marshal (this body carries no `request_id`) |
 | `404` | `NOT_FOUND` | `resource not found` | no route matches (default handler) |
 | `405` | `METHOD_NOT_ALLOWED` | `method not allowed` | the path matches but the method does not (default handler) |
+| `400` | `BAD_REQUEST` | `Idempotency-Key header is required` | an action with `IdempotencyKeyRequired` got no key (see idempotency keys) |
+| `400` | `BAD_REQUEST` | `Idempotency-Key header is malformed` | the key header is repeated, empty, or not a valid key |
+| `409` | `IDEMPOTENCY_KEY_IN_USE` | `a request with this Idempotency-Key is still running` | another request with the key hasn't finished; with `Retry-After: 1` |
+| `422` | `IDEMPOTENCY_KEY_REUSED` | `this Idempotency-Key was used for another request` | the key's saved response is for another method, URI, or body |
+| `503` | `SERVICE_UNAVAILABLE` | `the idempotency store is unavailable` | the idempotency store failed before the handler ran |
 
 Every mapped `5xx` is logged in full through the default `slog` logger (message
 `actions: handler error`), and every recovered panic is logged with its stack
-(`actions: handler panic`). The client sees only the mapped message.
+(`actions: handler panic`). The client sees only the mapped message. An idempotency store
+failure is also logged with the store's error (`actions: idempotency store failed`), and
+so is a response the store could not save (`actions: idempotency response not saved`) or a
+claim it could not release (`actions: idempotency claim not released`).
 
 **Codes.** The `Code*` constants are a stable wire vocabulary:
 
@@ -558,9 +574,12 @@ Every mapped `5xx` is logged in full through the default `slog` logger (message
 | `CodeForbidden` | `FORBIDDEN` | `CodeMethodNotAllowed` | `METHOD_NOT_ALLOWED` |
 | `CodeNotFound` | `NOT_FOUND` | `CodeTimeout` | `TIMEOUT` |
 | `CodeConflict` | `CONFLICT` | `CodeServiceUnavailable` | `SERVICE_UNAVAILABLE` |
+| `CodeIdempotencyKeyInUse` | `IDEMPOTENCY_KEY_IN_USE` | `CodeIdempotencyKeyReused` | `IDEMPOTENCY_KEY_REUSED` |
 
-The framework emits only the codes in the table above; the rest exist so your mappers and
-handlers agree on spelling across services.
+The framework emits only the codes in the table of errors it emits above, and
+`SERVICE_UNAVAILABLE`, `IDEMPOTENCY_KEY_IN_USE`, and `IDEMPOTENCY_KEY_REUSED` only on a
+registry built `WithIdempotency`; the rest exist so your mappers and handlers agree on
+spelling across services.
 
 **Retry-After.** Set `RetryAfter` to tell clients when to try again, typically on a `429`
 or `503`. When it is positive, the response carries a `Retry-After` header in whole
@@ -608,7 +627,8 @@ reg := actions.NewRegistry(actions.WithErrorCodes("IDENTITY_CONFLICT", "STEP_UP_
 ```
 
 `code` then carries an `enum` of the built-in `Code*` values plus yours, sorted and
-de-duplicated. Without `WithErrorCodes`, `code` stays an open string.
+de-duplicated; a registry built `WithIdempotency` adds `IDEMPOTENCY_KEY_IN_USE` and
+`IDEMPOTENCY_KEY_REUSED`. Without `WithErrorCodes`, `code` stays an open string.
 
 **foundationx adapter.** The optional `foundationx` sub-package is a ready-made
 `ErrorMapper` for the [`go-foundation`](https://github.com/mrz1836/go-foundation) error
@@ -644,6 +664,7 @@ reg := actions.NewRegistry(actions.WithErrorMapper(foundationx.NewErrorMapper())
 | `WithMiddleware(mw...)` | Registry-wide middleware on every route (actions, self-docs, `404`/`405`). The first is outermost; repeated calls append. It runs outside request-id and recovery (see middleware). |
 | `WithMaxBodyBytes(n)` | Caps the request body (default 1 MiB). `0` disables the cap; a negative value is ignored. A decode that reads past the cap is a `413`. |
 | `WithStrictDecoding()` | Rejects JSON bodies with unknown fields or trailing data (`400`, message exactly `malformed JSON body`, no parser detail). |
+| `WithIdempotency(store, opts)` | Lets the actions that set `IdempotencyKey` take an `Idempotency-Key` header over `store`, scoped by `opts.Scope` (required: it panics without one); see idempotency keys. A `nil` store is ignored. |
 | `WithObserver(fn)` | Per-request hook with action id, status, latency, request id, and error. `nil` is ignored. |
 | `WithRequestIDGenerator(fn)` | Mints the correlation id when none is inbound (default UUIDv4). `nil` is ignored. |
 | `WithNotFoundHandler(h)` / `WithMethodNotAllowedHandler(h)` | Replace the JSON `404` / `405` defaults. `nil` is ignored. |
@@ -651,6 +672,181 @@ reg := actions.NewRegistry(actions.WithErrorMapper(foundationx.NewErrorMapper())
 | `WithSecurity(reqs...)` | Sets the registry-wide default security requirements; repeated calls append. |
 | `WithServers(servers...)` | Sets the OpenAPI `servers[]` block; repeated calls append. |
 | `WithOpenAPIVersion(v)` | Declares the dialect: `"3.1.0"` (default) or `"3.0.3"`, which also switches the nullable and `[]byte` forms (see schema generation). Any other value panics in `NewRegistry`. |
+
+</details>
+
+<details>
+<summary><strong><code>Tool annotations</code></strong></summary>
+<br/>
+
+Give an action `Annotations` to tell a tool host, such as an MCP client, what calling it
+does. They are written on its OpenAPI operation as the `x-mcp-annotations` extension,
+with all four hints, in both dialects and in JSON and YAML alike:
+
+```go
+actions.Action[GetUserRequest, User]{
+	// ...
+	Annotations: &actions.Annotations{ReadOnly: true, Idempotent: true},
+}
+```
+
+```json
+"x-mcp-annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+```
+
+| Field | Hint | Meaning |
+| --- | --- | --- |
+| `ReadOnly` | `readOnlyHint` | reads only; changes nothing |
+| `Destructive` | `destructiveHint` | may delete or overwrite |
+| `Idempotent` | `idempotentHint` | repeating it with the same input has no further effect |
+| `OpenWorld` | `openWorldHint` | reaches systems outside this service |
+
+An action without `Annotations` writes no extension. The hints describe the action to a
+host deciding how to call it; nothing enforces them. `Freeze` refuses an action that is
+both `ReadOnly` and `Destructive`.
+
+</details>
+
+<details>
+<summary><strong><code>Idempotency keys</code></strong></summary>
+<br/>
+
+A client that retries a `POST` after a timeout can't tell whether the first attempt ran.
+With an `Idempotency-Key` header, as the IETF Idempotency-Key draft describes, the retry
+gets the first response instead of a second run. Build the registry `WithIdempotency`,
+and mark each `POST` or `PATCH` action that takes keys. In this example, `callerID` stands
+in for whatever your auth middleware puts on the request:
+
+```go
+reg := actions.NewRegistry(actions.WithIdempotency(store, actions.IdempotencyOptions{
+	Scope: func(r *http.Request) string { return callerID(r.Context()) }, // required
+}))
+
+actions.Register(reg, actions.Action[CreateOrderRequest, actions.Created[Order]]{
+	// ...
+	Method:         http.MethodPost,
+	Middleware:     []actions.Middleware{requireAuth},
+	IdempotencyKey: actions.IdempotencyKeyRequired, // or IdempotencyKeyOptional
+})
+```
+
+**The store.** An `IdempotencyStore` holds a claim on a key while its first request runs,
+and the response saved under the key afterwards:
+
+```go
+type IdempotencyStore interface {
+	Lookup(ctx context.Context, key string) (StoredResponse, bool, error)
+	Claim(ctx context.Context, key string, ttl time.Duration) (token string, claimed bool, err error)
+	Save(ctx context.Context, key string, resp StoredResponse, ttl time.Duration) error
+	Release(ctx context.Context, key, token string) error
+}
+```
+
+`Claim` returns `claimed` false, and no error, when another request holds the key, and
+`Release` drops a claim only with its own token. `StoredResponse` (`Fingerprint`,
+`Status`, `Header`, and `Body`) carries JSON tags, so a store can keep it as one value.
+`NewMemoryIdempotencyStore()` keeps everything in the process, for tests and
+single-process servers; a service that runs several processes needs a store they share,
+such as one over a cache.
+
+**Scope.** `Scope` names the caller a key belongs to, such as a user or an API key, so
+one caller's key never replays another's response. The store key is the lowercase hex
+SHA-256 of the scope, a newline, and the key. The step runs last of the action's own
+`Middleware`, so `Scope` sees what an auth middleware put on the request, and a request
+that middleware refuses never reaches the store. Every request a `Scope` returns one value
+for shares one namespace of keys.
+
+**Options.** `TTL` is how long a saved response is kept (24 hours by default),
+`InFlightTTL` how long a claim holds a key while its request runs (1 minute), and
+`MaxBody` the largest response body saved (1 MiB). A zero or negative value takes its
+default. `WithIdempotency` panics without a `Scope`, and ignores a nil store.
+
+**Outcomes**, for a `POST` or `PATCH` to an action that takes keys:
+
+| Request | Response | Store |
+| --- | --- | --- |
+| no header, `IdempotencyKeyOptional` | the handler runs as usual | untouched |
+| no header, `IdempotencyKeyRequired` | `400 BAD_REQUEST`, `Idempotency-Key header is required` | untouched |
+| a malformed header | `400 BAD_REQUEST`, `Idempotency-Key header is malformed` | untouched |
+| a saved key, the same request | the saved status, headers (all but `Set-Cookie`, `Date`, and `X-Request-ID`), and body, plus `Idempotent-Replayed: true`; the handler doesn't run | untouched |
+| a saved key, another request | `422 IDEMPOTENCY_KEY_REUSED`, `this Idempotency-Key was used for another request` | untouched |
+| a key another request still holds | `409 IDEMPOTENCY_KEY_IN_USE`, `a request with this Idempotency-Key is still running`, with `Retry-After: 1` | untouched |
+| a new key | the handler runs | claimed for `InFlightTTL`; a `2xx` whose body is at most `MaxBody` is saved for `TTL`; the claim is then released, whatever happens (an error, a timeout, a panic) |
+| the store fails before the handler | `503 SERVICE_UNAVAILABLE`, `the idempotency store is unavailable` | — |
+| the store fails while saving | the handler's response, with the failure logged | released |
+
+"The same request" means the same fingerprint: the lowercase hex SHA-256 of the method,
+the request URI, and the body, each followed by a newline but the last. The URI includes
+the raw query, so the same parameters in another order are another request. Details that
+follow from the table:
+
+- **The body is read first.** The step reads the whole request body, within the registry's
+  body cap, before it calls the store, and hands the decoder the same bytes. A body over
+  the cap is a `413` that touches no store.
+- **Only a success is saved.** A refused or failed request (a `401`, a `403`, a `500`, a
+  `504`) never blocks its retry, and a `2xx` larger than `MaxBody` is sent but not saved.
+- **A finished request is never run twice.** After claiming a key, the step looks it up
+  once more, so a request with that key that finished in between is answered rather than
+  run again.
+- **A client that leaves still frees its key.** `Save` and `Release` run without the
+  request's cancellation.
+- **The replay carries this request's id.** `X-Request-ID` is never saved, so a replayed
+  response has the retry's own.
+
+**The header.** The value is an RFC 8941 String, such as `"order-7"`, whose escapes are
+`\"` and `\\`, or the same characters bare, `order-7`. Quoted, the key is the unescaped
+content, so it may hold `"` or `\`; bare, it is printable ASCII other than `"` and `\`.
+Either way the key is 1–255 characters, counted after unescaping, and a quoted key and the
+same key bare are one key. Two header values, an empty value, or anything else is
+malformed.
+
+**The contract.** Each keyed operation lists an `Idempotency-Key` header parameter
+(`required` under `IdempotencyKeyRequired`), plus `409` (with its `Retry-After` header) and
+`422` Error responses unless the action documents those statuses itself. With
+`WithErrorCodes`, the Error schema's `code` enum also lists `IDEMPOTENCY_KEY_IN_USE` and
+`IDEMPOTENCY_KEY_REUSED`; a registry built without `WithIdempotency` never lists them.
+
+`Freeze` refuses `IdempotencyKey` on a method other than `POST` or `PATCH`, and on a
+registry without a store.
+
+</details>
+
+<details>
+<summary><strong><code>Raw responses</code></strong></summary>
+<br/>
+
+For a body that isn't JSON, such as a CSV export, return `actions.Raw` and declare the
+media type on the action's `200` `StatusDoc`. In this example, `exportCSV` stands in for
+your own encoder:
+
+```go
+actions.Action[ExportRequest, actions.Raw]{
+	ID:     "orders.export",
+	Method: http.MethodGet,
+	Path:   "/orders/export",
+	Statuses: []actions.StatusDoc{
+		{Code: http.StatusOK, MediaType: "text/csv; charset=utf-8"},
+		{Code: http.StatusNotFound, Error: true},
+	},
+	Handle: func(ctx context.Context, req ExportRequest) (actions.Raw, error) {
+		return actions.Raw{
+			Header: http.Header{"Content-Disposition": {"attachment; filename=orders.csv"}},
+			Body:   exportCSV(ctx, req),
+		}, nil
+	},
+}
+```
+
+The response is a `200` with `Raw.Header` added, `Content-Type` set to the declared media
+type (replacing any `Content-Type` in `Header`), and `Body` written byte for byte; an empty
+`Body` is a `200` with no content. In the contract, that `200` is
+`"content": {"text/csv; charset=utf-8": {"schema": {"type": "string"}}}`, with no component
+for `Raw`, and error responses keep the JSON `Error` schema.
+
+The bytes go out as given: escaping the content, such as CSV cells a spreadsheet would
+read as formulas, is up to the producer. `Raw` is a buffered body, not a stream. `Freeze`
+refuses a `Raw` action whose `200` `StatusDoc` declares no `MediaType`, and a `MediaType`
+on any other `StatusDoc`.
 
 </details>
 
@@ -670,7 +866,8 @@ WithMiddleware ...                 your registry-wide middleware (the first is o
                └─ timeout          only when Action.Timeout > 0
                   └─ body cap      only when WithMaxBodyBytes > 0 (default 1 MiB)
                      └─ Action.Middleware ...   (the first is outermost)
-                        └─ decode → validate → Handle → encode
+                        └─ Idempotency-Key      only when Action.IdempotencyKey is set: replay, refuse, or claim
+                           └─ decode → validate → Handle → encode
 ```
 
 What follows from that order:
@@ -685,6 +882,9 @@ What follows from that order:
   not `404`/`405` responses.
 - **`Action.Middleware` runs before decoding**, so an auth check there rejects a request
   before its body is read. Its first entry is the outermost.
+- **The `Idempotency-Key` step runs after `Action.Middleware`**, so a request it refuses
+  claims no key, and the registry's `Scope` sees what it put on the request (see
+  idempotency keys).
 - **Aborts pass through.** A handler that panics with `http.ErrAbortHandler` is re-panicked
   so `net/http` aborts the connection; it is not turned into a `500` and is not observed.
 - **Inbound request ids are trusted.** The id comes from `X-Request-ID`, then
@@ -1342,7 +1542,7 @@ Medians of `go test -run '^$' -bench . -benchmem -count 6`, measured with Go 1.2
 | `Paginate/has_more` | trimming a page and deriving its cursor | 13.8 | 0 | 0 |
 | `ClampLimit/500` | clamping a page size | 2.2 | 0 | 0 |
 | `BuildOpenAPI` | registering and freezing a two-action registry (once per process) | 138,328 | 223,210 | 1,160 |
-| `BuildOpenAPIPetstore` | building and freezing the pet-store registry (once per process) ¹ | 249,293 | 422,661 | 1,821 |
+| `BuildOpenAPIPetstore` | building and freezing the pet-store registry (once per process) ¹ | 286,276 | 442,532 | 2,087 |
 
 > The `Handler` and `DecodeRequest` rows include building the `*http.Request` (and, for
 > `Handler`, the response recorder). The per-request hot path is decode, validate, and
@@ -1350,9 +1550,9 @@ Medians of `go test -run '^$' -bench . -benchmem -count 6`, measured with Go 1.2
 > Binding and validation plans are compiled once per request type, so a request does no
 > struct-tag parsing. Contract generation runs once, at `Freeze`.
 
-¹ Measured on 2026-10-13 with Go 1.27.2 on the same machine, after the pet store gained its
-repeated `tag` filter and the `PetTag` enum. Most of the growth is encoding the larger
-document as YAML.
+¹ Measured on 2026-10-19 with Go 1.27.2 on the same machine, after the pet store gained an
+idempotent create and an annotated read, so its contract now also carries the
+`Idempotency-Key` parameter, the `409` and `422` responses, and the tool annotations.
 
 <br/>
 
