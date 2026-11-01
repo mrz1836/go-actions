@@ -19,9 +19,9 @@ func (r *Registry) buildArtifacts() {
 	r.buildIndex()
 }
 
-// buildOpenAPI assembles the OpenAPI document in the declared dialect, marshals
-// it once to JSON, and derives the YAML serialization from the same structure.
-// The info block is taken from the registry's configured (or default) OpenAPI
+// buildOpenAPI assembles the OpenAPI document in the declared dialect and
+// marshals it once to JSON, from which buildOpenAPIYAML derives the YAML. The
+// info block is taken from the registry's configured (or default) OpenAPI
 // info.
 func (r *Registry) buildOpenAPI() {
 	version := r.openapiVersion
@@ -81,10 +81,17 @@ func (r *Registry) buildOpenAPI() {
 		panic(fmt.Errorf("actions: marshal OpenAPI JSON: %w", err))
 	}
 	r.openapiJSON = append(jsonBytes, '\n')
+}
 
+// buildOpenAPIYAML serializes the OpenAPI JSON as YAML, decoding it first so the
+// YAML holds exactly the document the JSON holds. Rendering a large document as
+// YAML costs far more than building it, so it runs only when the YAML is first
+// asked for (see OpenAPIYAML). The JSON was marshaled from plain maps, slices,
+// and scalars, so neither step can fail; a failure panics.
+func (r *Registry) buildOpenAPIYAML() {
 	var roundTrip any
-	if decodeErr := json.Unmarshal(jsonBytes, &roundTrip); decodeErr != nil {
-		panic(fmt.Errorf("actions: re-decode OpenAPI: %w", decodeErr))
+	if err := json.Unmarshal(r.openapiJSON, &roundTrip); err != nil {
+		panic(fmt.Errorf("actions: re-decode OpenAPI: %w", err))
 	}
 	yamlBytes, err := yaml.Marshal(roundTrip)
 	if err != nil {

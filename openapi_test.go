@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -353,6 +355,44 @@ func TestOpenAPI_JSONYAMLParity(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, string(jsonCanon), string(yamlCanon),
 		"the JSON and YAML serializations must carry identical content")
+}
+
+// TestOpenAPI_YAMLIsNilBeforeFreeze proves the YAML, like the JSON, exists only
+// once the registry is frozen.
+func TestOpenAPI_YAMLIsNilBeforeFreeze(t *testing.T) {
+	t.Parallel()
+	reg := actions.NewRegistry()
+	actions.Register(reg, pingAction())
+
+	assert.Nil(t, reg.OpenAPIYAML(), "no YAML before Freeze")
+	reg.Freeze()
+	assert.NotEmpty(t, reg.OpenAPIYAML(), "the YAML once frozen")
+}
+
+// TestOpenAPI_YAMLIsRenderedOnce proves every reader of the YAML, however many
+// ask at once, gets the one rendering, and /openapi.yaml serves the same bytes.
+func TestOpenAPI_YAMLIsRenderedOnce(t *testing.T) {
+	t.Parallel()
+	reg := frozenPingRegistry(t)
+
+	const readers = 8
+	got := make([][]byte, readers)
+	var wg sync.WaitGroup
+	for i := range readers {
+		wg.Go(func() { got[i] = reg.OpenAPIYAML() })
+	}
+	wg.Wait()
+	for i := range got {
+		require.NotEmpty(t, got[i])
+		assert.Same(t, &got[0][0], &got[i][0], "reader %d gets the one rendering", i)
+	}
+
+	srv := httptest.NewServer(reg.Handler())
+	t.Cleanup(srv.Close)
+	body, contentType, status := getBody(t, srv.URL+"/openapi.yaml", "")
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "application/yaml; charset=utf-8", contentType)
+	assert.Equal(t, string(got[0]), body, "/openapi.yaml serves the same bytes")
 }
 
 // collectRefs walks an arbitrary JSON tree and records every "$ref" string value.
