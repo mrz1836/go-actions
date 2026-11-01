@@ -178,8 +178,9 @@ const defaultMaxBodyBytes = 1 << 20
 // defaultOpenAPIVersion is the OpenAPI dialect declared unless overridden.
 const defaultOpenAPIVersion = "3.1.0"
 
-// Registry stores registered actions and, after Freeze, the pre-built
-// self-documentation artifacts.
+// Registry stores registered actions and, after Freeze, the self-documentation
+// artifacts: the OpenAPI JSON and the _actions index, built by Freeze, and the
+// OpenAPI YAML, built from the JSON the first time it is asked for.
 type Registry struct {
 	mu      sync.Mutex
 	actions []anyAction
@@ -210,10 +211,14 @@ type Registry struct {
 	securitySchemes map[string]SecurityScheme
 	security        []SecurityRequirement
 
-	openapiJSON   []byte
-	openapiYAML   []byte
-	indexHTML     []byte
-	indexMarkdown []byte
+	openapiJSON []byte
+	// openapiYAML is built from openapiJSON under openapiYAMLOnce, the first
+	// time OpenAPIYAML is called or /openapi.yaml is served, so a registry whose
+	// YAML nobody reads never renders it.
+	openapiYAML     []byte
+	openapiYAMLOnce sync.Once
+	indexHTML       []byte
+	indexMarkdown   []byte
 }
 
 // NewRegistry returns an empty Registry configured by the given options. With no
@@ -399,7 +404,9 @@ func (r *Registry) Handler() http.Handler {
 		mux.Method(a.method, r.mountPath(a.path), r.wrapAction(a))
 	}
 	mux.Get("/openapi.json", r.serveBytes("application/json", r.openapiJSON))
-	mux.Get("/openapi.yaml", r.serveBytes("application/yaml", r.openapiYAML))
+	mux.Get("/openapi.yaml", func(w http.ResponseWriter, req *http.Request) {
+		r.serveBytes("application/yaml", r.OpenAPIYAML())(w, req)
+	})
 	mux.Get("/_actions", r.serveIndex)
 
 	// Mux-level middleware wraps every route (actions, self-docs, 404/405):
@@ -417,8 +424,18 @@ func (r *Registry) Handler() http.Handler {
 func (r *Registry) OpenAPIJSON() []byte { return r.openapiJSON }
 
 // OpenAPIYAML returns the same OpenAPI document as OpenAPIJSON, serialized as
-// YAML. It is nil before Freeze.
-func (r *Registry) OpenAPIYAML() []byte { return r.openapiYAML }
+// YAML. It is nil before Freeze. The YAML is built from the JSON on the first
+// call after Freeze, once, and every later call returns the same bytes.
+func (r *Registry) OpenAPIYAML() []byte {
+	r.mu.Lock()
+	frozen := r.frozen
+	r.mu.Unlock()
+	if !frozen {
+		return nil
+	}
+	r.openapiYAMLOnce.Do(r.buildOpenAPIYAML)
+	return r.openapiYAML
+}
 
 // wrapAction composes one action's handler with its framework and per-action
 // middleware, outermost-first: observe (if configured) → recover → timeout (if

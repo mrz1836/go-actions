@@ -308,7 +308,9 @@ endpoints move under the mount point (`/v1/openapi.json`).
 - **Markdown index:** `/_actions` answers with `text/markdown; charset=utf-8` when `Accept`
   includes `text/markdown` or `text/plain`.
 - **Caching:** the two OpenAPI endpoints send `Cache-Control: public, max-age=300`.
-- **Serving:** all three are `GET` routes, built once by `Freeze` and served from memory.
+- **Serving:** all three are `GET` routes, each built once and served from memory. `Freeze`
+  builds the JSON and the index; the YAML is rendered from the JSON the first time it is
+  asked for, since rendering a large document as YAML costs far more than building it.
 - **Snapshots:** the output is deterministic (actions sorted by `ID`, object keys sorted), so
   it is safe to commit as a snapshot and diff in CI (see
   [`examples/openapi-snapshot`](examples/openapi-snapshot)).
